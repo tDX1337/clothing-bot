@@ -21,9 +21,9 @@ from aiogram.types import (
 # НАСТРОЙКИ
 # ============================================================
 
-TOKEN = "8816088914:AAGvK79K4bdhHzJWf42VwdW0u_ke7OEC9hc"
-DB_NAME = "shop.db"
+import os
 
+TOKEN = os.getenv("BOT_TOKEN")
 
 # ============================================================
 # БАЗА ДАННЫХ
