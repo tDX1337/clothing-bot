@@ -24,6 +24,7 @@ from aiogram.types import (
 import os
 
 TOKEN = os.getenv("BOT_TOKEN")
+DB_NAME = "shop.db"
 
 # ============================================================
 # БАЗА ДАННЫХ
