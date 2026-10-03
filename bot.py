@@ -25,17 +25,199 @@ from aiogram.types import (
 
 TOKEN = os.getenv("BOT_TOKEN")
 
-DB_NAME = "shop.db"
+if not TOKEN:
+    raise RuntimeError("Не найден BOT_TOKEN")
 
+DB_NAME = "shop.db"
 ADMIN_ID = 5529220398
 
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN не найден в переменных окружения")
+# =========================================================
+# БАЗА ДАННЫХ
+# =========================================================
+
+def get_db():
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+
+    # -----------------------------------------------------
+    # ПРОВЕРКА СТАРОЙ СТРУКТУРЫ
+    # -----------------------------------------------------
+
+    cur.execute("PRAGMA table_info(products)")
+    columns = [row[1] for row in cur.fetchall()]
+
+    if "size" in columns:
+        cur.execute("DROP TABLE IF EXISTS sales")
+        cur.execute("DROP TABLE IF EXISTS product_sizes")
+        cur.execute("DROP TABLE IF EXISTS products")
+
+    # -----------------------------------------------------
+    # PRODUCTS
+    # -----------------------------------------------------
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            purchase_price REAL NOT NULL DEFAULT 0,
+            sale_price REAL NOT NULL DEFAULT 0
+        )
+    """)
+
+    # -----------------------------------------------------
+    # PRODUCT SIZES
+    # -----------------------------------------------------
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS product_sizes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            size TEXT NOT NULL,
+            stock INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(product_id) REFERENCES products(id)
+                ON DELETE CASCADE
+        )
+    """)
+
+    # -----------------------------------------------------
+    # SALES
+    # -----------------------------------------------------
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER,
+            size_id INTEGER,
+            product_name TEXT NOT NULL,
+            size TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            sale_price REAL NOT NULL,
+            purchase_price REAL NOT NULL,
+            profit REAL NOT NULL,
+            payment_method TEXT NOT NULL DEFAULT 'cash',
+            status TEXT NOT NULL DEFAULT 'completed',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(product_id) REFERENCES products(id)
+                ON DELETE SET NULL
+        )
+    """)
+
+    # Миграция старой sales
+    cur.execute("PRAGMA table_info(sales)")
+    sales_columns = [row[1] for row in cur.fetchall()]
+
+    if "payment_method" not in sales_columns:
+        cur.execute("""
+            ALTER TABLE sales
+            ADD COLUMN payment_method TEXT NOT NULL DEFAULT 'cash'
+        """)
+
+    if "status" not in sales_columns:
+        cur.execute("""
+            ALTER TABLE sales
+            ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'
+        """)
+
+    if "size_id" not in sales_columns:
+        cur.execute("""
+            ALTER TABLE sales
+            ADD COLUMN size_id INTEGER
+        """)
+
+    # -----------------------------------------------------
+    # АВТОМАТИЧЕСКОЕ ВОССТАНОВЛЕНИЕ size_id
+    # ДЛЯ СТАРЫХ ПРОДАЖ
+    # -----------------------------------------------------
+
+    cur.execute("""
+        UPDATE sales
+        SET size_id = (
+            SELECT ps.id
+            FROM product_sizes ps
+            WHERE ps.product_id = sales.product_id
+              AND LOWER(TRIM(ps.size)) = LOWER(TRIM(sales.size))
+            LIMIT 1
+        )
+        WHERE size_id IS NULL
+          AND product_id IS NOT NULL
+    """)
+
+    # -----------------------------------------------------
+    # ALLOWED USERS
+    # -----------------------------------------------------
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS allowed_users (
+            user_id INTEGER PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # -----------------------------------------------------
+    # EXPENSES
+    # -----------------------------------------------------
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            description TEXT NOT NULL,
+            amount REAL NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
 
 
 # =========================================================
-# BOT / DISPATCHER
+# FSM
+# =========================================================
+
+class AddProduct(StatesGroup):
+    name = State()
+    purchase_price = State()
+    sale_price = State()
+    sizes = State()
+    stock = State()
+
+
+class ReplenishStock(StatesGroup):
+    quantity = State()
+
+
+class Sale(StatesGroup):
+    quantity = State()
+    actual_price = State()
+
+
+class EditProduct(StatesGroup):
+    name = State()
+    purchase_price = State()
+    sale_price = State()
+
+
+class Access(StatesGroup):
+    user_id = State()
+
+
+class Expense(StatesGroup):
+    description = State()
+    amount = State()
+
+
+# =========================================================
+# BOT
 # =========================================================
 
 bot = Bot(
@@ -49,114 +231,8 @@ dp = Dispatcher()
 
 
 # =========================================================
-# DATABASE
-# =========================================================
-
-def get_db():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
-def init_db():
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    # Проверяем старую структуру products
-    cur.execute("PRAGMA table_info(products)")
-    columns = [row["name"] for row in cur.fetchall()]
-
-    # Если база от старой версии,
-    # где размер находился прямо в products,
-    # создаём новую структуру.
-    if "size" in columns:
-
-        cur.execute("DROP TABLE IF EXISTS sales")
-        cur.execute("DROP TABLE IF EXISTS product_sizes")
-        cur.execute("DROP TABLE IF EXISTS products")
-
-    # Товары
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            purchase_price REAL NOT NULL,
-            sale_price REAL NOT NULL
-        )
-    """)
-
-    # Размеры и остатки
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS product_sizes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL,
-            size TEXT NOT NULL,
-            stock INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY(product_id)
-                REFERENCES products(id)
-                ON DELETE CASCADE
-        )
-    """)
-
-    # Продажи
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sales (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL,
-            product_name TEXT NOT NULL,
-            size TEXT NOT NULL,
-            quantity INTEGER NOT NULL,
-            sale_price REAL NOT NULL,
-            purchase_price REAL NOT NULL,
-            profit REAL NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Пользователи с доступом
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS allowed_users (
-            user_id INTEGER PRIMARY KEY,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Администратор всегда имеет доступ
-    cur.execute(
-        "INSERT OR IGNORE INTO allowed_users (user_id) VALUES (?)",
-        (ADMIN_ID,)
-    )
-
-    conn.commit()
-    conn.close()
-
-
-# =========================================================
 # ACCESS
 # =========================================================
-
-def has_access(user_id: int) -> bool:
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT 1 FROM allowed_users WHERE user_id = ?",
-        (user_id,)
-    )
-
-    result = cur.fetchone()
-
-    conn.close()
-
-    return result is not None
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
 
 class AccessMiddleware(BaseMiddleware):
 
@@ -167,30 +243,44 @@ class AccessMiddleware(BaseMiddleware):
         data: Dict[str, Any]
     ) -> Any:
 
-        user = getattr(event, "from_user", None)
+        user = data.get("event_from_user")
 
         if not user:
             return await handler(event, data)
 
-        if not has_access(user.id):
+        user_id = user.id
 
-            if isinstance(event, Message):
+        if user_id == ADMIN_ID:
+            return await handler(event, data)
 
-                await event.answer(
-                    "🔒 <b>Доступ закрыт.</b>\n\n"
-                    "У вас нет доступа к этому боту."
-                )
+        conn = get_db()
+        cur = conn.cursor()
 
-            elif isinstance(event, CallbackQuery):
+        cur.execute(
+            "SELECT user_id FROM allowed_users WHERE user_id = ?",
+            (user_id,)
+        )
 
-                await event.answer(
-                    "🔒 Доступ закрыт.",
-                    show_alert=True
-                )
+        allowed = cur.fetchone()
 
-            return
+        conn.close()
 
-        return await handler(event, data)
+        if allowed:
+            return await handler(event, data)
+
+        if isinstance(event, Message):
+            await event.answer(
+                "⛔ <b>У вас нет доступа к боту.</b>\n\n"
+                "Обратитесь к администратору."
+            )
+
+        elif isinstance(event, CallbackQuery):
+            await event.answer(
+                "⛔ У вас нет доступа.",
+                show_alert=True
+            )
+
+        return
 
 
 dp.message.outer_middleware(AccessMiddleware())
@@ -198,82 +288,40 @@ dp.callback_query.outer_middleware(AccessMiddleware())
 
 
 # =========================================================
-# KEYBOARDS
+# КЛАВИАТУРА
 # =========================================================
-
-def main_menu() -> ReplyKeyboardMarkup:
-
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="📦 Наличие товаров"),
-                KeyboardButton(text="🛒 Продажа"),
-            ],
-            [
-                KeyboardButton(text="📊 Статистика"),
-                KeyboardButton(text="💰 Прибыль"),
-            ],
-            [
-                KeyboardButton(text="➕ Добавить товар"),
-                KeyboardButton(text="📥 Пополнить остаток"),
-            ],
-            [
-                KeyboardButton(text="✏️ Изменить товар"),
-                KeyboardButton(text="🗑️ Удалить товар"),
-            ],
-        ],
-        resize_keyboard=True
-    )
-
-
-def admin_menu() -> ReplyKeyboardMarkup:
-
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="📦 Наличие товаров"),
-                KeyboardButton(text="🛒 Продажа"),
-            ],
-            [
-                KeyboardButton(text="📊 Статистика"),
-                KeyboardButton(text="💰 Прибыль"),
-            ],
-            [
-                KeyboardButton(text="➕ Добавить товар"),
-                KeyboardButton(text="📥 Пополнить остаток"),
-            ],
-            [
-                KeyboardButton(text="✏️ Изменить товар"),
-                KeyboardButton(text="🗑️ Удалить товар"),
-            ],
-            [
-                KeyboardButton(text="🔐 Доступ"),
-            ],
-        ],
-        resize_keyboard=True
-    )
-
 
 def get_menu(user_id: int) -> ReplyKeyboardMarkup:
 
-    if is_admin(user_id):
-        return admin_menu()
+    rows = [
+        [
+            KeyboardButton(text="📦 Наличие товаров"),
+            KeyboardButton(text="🛒 Продажа"),
+        ],
+        [
+            KeyboardButton(text="📊 Статистика"),
+            KeyboardButton(text="💰 Прибыль"),
+        ],
+        [
+            KeyboardButton(text="➕ Добавить товар"),
+            KeyboardButton(text="📥 Пополнить остаток"),
+        ],
+        [
+            KeyboardButton(text="✏️ Изменить товар"),
+            KeyboardButton(text="🗑️ Удалить товар"),
+        ],
+    ]
 
-    return main_menu()
+    if user_id == ADMIN_ID:
+        rows.append([
+            KeyboardButton(text="🔐 Доступ")
+        ])
 
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True
+    )
 
-# =========================================================
-# ГЛОБАЛЬНАЯ НАВИГАЦИЯ
-# =========================================================
-# Эти кнопки имеют приоритет над любым FSM-состоянием.
-#
-# Например:
-# Продажа → товар → размер → количество
-# ↓
-# нажимаем "Удалить товар"
-#
-# Продажа сбрасывается и открывается удаление товара.
-# =========================================================
 
 MAIN_MENU_BUTTONS = {
     "📦 Наличие товаров",
@@ -288,59 +336,82 @@ MAIN_MENU_BUTTONS = {
 }
 
 
-@dp.message(F.text.in_(MAIN_MENU_BUTTONS))
-async def global_menu_navigation(
-    message: Message,
-    state: FSMContext
-):
+# =========================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =========================================================
 
-    # Сбрасываем текущее действие
-    await state.clear()
+def money(value: float) -> str:
+    return (
+        f"{value:,.2f}"
+        .replace(",", " ")
+        .replace(".", ",")
+        + " ₽"
+    )
 
-    if message.text == "📦 Наличие товаров":
 
-        await show_products(message)
-        return
+def get_products():
+    conn = get_db()
+    cur = conn.cursor()
 
-    if message.text == "🛒 Продажа":
+    cur.execute("""
+        SELECT id, name, purchase_price, sale_price
+        FROM products
+        ORDER BY id DESC
+    """)
 
-        await sale_start(message, state)
-        return
+    rows = cur.fetchall()
+    conn.close()
 
-    if message.text == "📊 Статистика":
+    return rows
 
-        await statistics(message)
-        return
 
-    if message.text == "💰 Прибыль":
+def get_product(product_id: int):
+    conn = get_db()
+    cur = conn.cursor()
 
-        await profit(message)
-        return
+    cur.execute("""
+        SELECT id, name, purchase_price, sale_price
+        FROM products
+        WHERE id = ?
+    """, (product_id,))
 
-    if message.text == "➕ Добавить товар":
+    row = cur.fetchone()
+    conn.close()
 
-        await add_product_start(message, state)
-        return
+    return row
 
-    if message.text == "📥 Пополнить остаток":
 
-        await add_stock_start(message, state)
-        return
+def get_sizes(product_id: int):
+    conn = get_db()
+    cur = conn.cursor()
 
-    if message.text == "✏️ Изменить товар":
+    cur.execute("""
+        SELECT id, size, stock
+        FROM product_sizes
+        WHERE product_id = ?
+        ORDER BY id
+    """, (product_id,))
 
-        await edit_product_start(message, state)
-        return
+    rows = cur.fetchall()
+    conn.close()
 
-    if message.text == "🗑️ Удалить товар":
+    return rows
 
-        await delete_product_start(message)
-        return
 
-    if message.text == "🔐 Доступ":
+def get_size(size_id: int):
+    conn = get_db()
+    cur = conn.cursor()
 
-        await access_menu(message, state)
-        return
+    cur.execute("""
+        SELECT id, product_id, size, stock
+        FROM product_sizes
+        WHERE id = ?
+    """, (size_id,))
+
+    row = cur.fetchone()
+    conn.close()
+
+    return row
 
 
 # =========================================================
@@ -348,40 +419,2564 @@ async def global_menu_navigation(
 # =========================================================
 
 @dp.message(CommandStart())
-async def start(
-    message: Message,
-    state: FSMContext
-):
+async def start(message: Message, state: FSMContext):
 
     await state.clear()
 
     await message.answer(
         "👋 <b>Добро пожаловать!</b>\n\n"
-        "Выберите нужный раздел:",
+        "Выберите действие:",
         reply_markup=get_menu(message.from_user.id)
     )
 
 
 # =========================================================
-# ACCESS MANAGEMENT
+# ГЛОБАЛЬНАЯ НАВИГАЦИЯ
 # =========================================================
 
-class AccessControl(StatesGroup):
-
-    add_user_id = State()
-
-
-async def access_menu(
+@dp.message(F.text.in_(MAIN_MENU_BUTTONS))
+async def global_menu_navigation(
     message: Message,
     state: FSMContext
 ):
 
     await state.clear()
 
-    if not is_admin(message.from_user.id):
+    text = message.text
+
+    if text == "📦 Наличие товаров":
+        await show_stock(message)
+
+    elif text == "🛒 Продажа":
+        await sale_start(message)
+
+    elif text == "📊 Статистика":
+        await show_statistics(message)
+
+    elif text == "💰 Прибыль":
+        await show_profit(message)
+
+    elif text == "➕ Добавить товар":
+        await add_product_start(message, state)
+
+    elif text == "📥 Пополнить остаток":
+        await replenish_start(message)
+
+    elif text == "✏️ Изменить товар":
+        await edit_product_start(message)
+
+    elif text == "🗑️ Удалить товар":
+        await delete_product_start(message)
+
+    elif text == "🔐 Доступ":
+        if message.from_user.id == ADMIN_ID:
+            await access_start(message, state)
+
+
+# =========================================================
+# НАЛИЧИЕ
+# =========================================================
+
+async def show_stock(message: Message):
+
+    products = get_products()
+
+    if not products:
+        await message.answer(
+            "📦 <b>Наличие товаров</b>\n\n"
+            "Товаров пока нет."
+        )
+        return
+
+    text = "📦 <b>НАЛИЧИЕ ТОВАРОВ</b>\n\n"
+
+    for product_id, name, purchase_price, sale_price in products:
+
+        text += (
+            f"🛍 <b>{name}</b>\n"
+            f"Закупка: {money(purchase_price)}\n"
+            f"Продажа: {money(sale_price)}\n"
+        )
+
+        sizes = get_sizes(product_id)
+
+        if sizes:
+            for _, size, stock in sizes:
+                text += f"   • {size}: <b>{stock} шт.</b>\n"
+        else:
+            text += "   • Нет размеров\n"
+
+        text += "\n"
+
+    await message.answer(text)
+
+
+# =========================================================
+# ДОБАВЛЕНИЕ ТОВАРА
+# =========================================================
+
+async def add_product_start(
+    message: Message,
+    state: FSMContext
+):
+
+    await state.clear()
+    await state.set_state(AddProduct.name)
+
+    await message.answer(
+        "➕ <b>Добавление товара</b>\n\n"
+        "Введите название товара:"
+    )
+
+
+@dp.message(AddProduct.name)
+async def add_product_name(
+    message: Message,
+    state: FSMContext
+):
+
+    name = message.text.strip()
+
+    if not name:
+        await message.answer("Введите название товара.")
+        return
+
+    await state.update_data(name=name)
+    await state.set_state(AddProduct.purchase_price)
+
+    await message.answer(
+        "Введите закупочную цену (₽):"
+    )
+
+
+@dp.message(AddProduct.purchase_price)
+async def add_product_purchase(
+    message: Message,
+    state: FSMContext
+):
+
+    try:
+        price = float(message.text.replace(",", "."))
+        if price < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректную цену.\n"
+            "Например: 1500"
+        )
+        return
+
+    await state.update_data(purchase_price=price)
+    await state.set_state(AddProduct.sale_price)
+
+    await message.answer(
+        "Введите цену продажи (₽):"
+    )
+
+
+@dp.message(AddProduct.sale_price)
+async def add_product_sale(
+    message: Message,
+    state: FSMContext
+):
+
+    try:
+        price = float(message.text.replace(",", "."))
+        if price < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректную цену.\n"
+            "Например: 2490"
+        )
+        return
+
+    await state.update_data(sale_price=price)
+    await state.set_state(AddProduct.sizes)
+
+    await message.answer(
+        "Введите размеры через запятую.\n\n"
+        "Например:\n"
+        "<code>S, M, L, XL</code>\n\n"
+        "Если размер не нужен:\n"
+        "<code>ONE SIZE</code>"
+    )
+
+
+@dp.message(AddProduct.sizes)
+async def add_product_sizes(
+    message: Message,
+    state: FSMContext
+):
+
+    sizes = [
+        item.strip()
+        for item in message.text.split(",")
+        if item.strip()
+    ]
+
+    if not sizes:
+        await message.answer(
+            "❌ Укажите хотя бы один размер."
+        )
+        return
+
+    await state.update_data(
+        sizes=sizes,
+        current_size_index=0,
+        stocks=[]
+    )
+
+    await state.set_state(AddProduct.stock)
+
+    await message.answer(
+        f"Введите остаток для размера "
+        f"<b>{sizes[0]}</b>:"
+    )
+
+
+@dp.message(AddProduct.stock)
+async def add_product_stock(
+    message: Message,
+    state: FSMContext
+):
+
+    try:
+        stock = int(message.text)
+
+        if stock < 0:
+            raise ValueError
+
+    except ValueError:
+        await message.answer(
+            "❌ Введите целое число.\n"
+            "Например: 20"
+        )
+        return
+
+    data = await state.get_data()
+
+    sizes = data["sizes"]
+    index = data["current_size_index"]
+    stocks = data["stocks"]
+
+    stocks.append(stock)
+    index += 1
+
+    if index < len(sizes):
+
+        await state.update_data(
+            current_size_index=index,
+            stocks=stocks
+        )
 
         await message.answer(
-            "⛔ У вас нет прав администратора."
+            f"Введите остаток для размера "
+            f"<b>{sizes[index]}</b>:"
+        )
+
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO products (
+            name,
+            purchase_price,
+            sale_price
+        )
+        VALUES (?, ?, ?)
+    """, (
+        data["name"],
+        data["purchase_price"],
+        data["sale_price"]
+    ))
+
+    product_id = cur.lastrowid
+
+    for size, size_stock in zip(sizes, stocks):
+
+        cur.execute("""
+            INSERT INTO product_sizes (
+                product_id,
+                size,
+                stock
+            )
+            VALUES (?, ?, ?)
+        """, (
+            product_id,
+            size,
+            size_stock
+        ))
+
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Товар добавлен!</b>\n\n"
+        f"🛍 {data['name']}\n"
+        f"Закупка: {money(data['purchase_price'])}\n"
+        f"Продажа: {money(data['sale_price'])}\n\n"
+        "Остатки сохранены.",
+        reply_markup=get_menu(message.from_user.id)
+    )
+
+
+# =========================================================
+# ПОПОЛНЕНИЕ
+# =========================================================
+
+async def replenish_start(message: Message):
+
+    products = get_products()
+
+    if not products:
+        await message.answer("📥 Товаров пока нет.")
+        return
+
+    buttons = []
+
+    for product_id, name, _, _ in products:
+        buttons.append([
+            InlineKeyboardButton(
+                text=name,
+                callback_data=f"replenish_product:{product_id}"
+            )
+        ])
+
+    await message.answer(
+        "📥 <b>Пополнение остатка</b>\n\n"
+        "Выберите товар:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+    )
+
+
+@dp.callback_query(F.data.startswith("replenish_product:"))
+async def replenish_product(callback: CallbackQuery):
+
+    product_id = int(callback.data.split(":")[1])
+    product = get_product(product_id)
+
+    if not product:
+        await callback.answer(
+            "Товар не найден.",
+            show_alert=True
+        )
+        return
+
+    sizes = get_sizes(product_id)
+
+    buttons = []
+
+    for size_id, size, stock in sizes:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{size} — {stock} шт.",
+                callback_data=f"replenish_size:{size_id}"
+            )
+        ])
+
+    await callback.message.edit_text(
+        f"📥 <b>{product[1]}</b>\n\n"
+        "Выберите размер:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("replenish_size:"))
+async def replenish_size(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    size_id = int(callback.data.split(":")[1])
+    size = get_size(size_id)
+
+    if not size:
+        await callback.answer(
+            "Размер не найден.",
+            show_alert=True
+        )
+        return
+
+    await state.update_data(
+        replenish_size_id=size_id
+    )
+
+    await state.set_state(ReplenishStock.quantity)
+
+    await callback.message.edit_text(
+        f"📥 Размер: <b>{size[2]}</b>\n\n"
+        f"Сейчас на складе: <b>{size[3]} шт.</b>\n\n"
+        "Введите количество, которое добавить:"
+    )
+
+    await callback.answer()
+
+
+@dp.message(ReplenishStock.quantity)
+async def replenish_quantity(
+    message: Message,
+    state: FSMContext
+):
+
+    try:
+        quantity = int(message.text)
+
+        if quantity <= 0:
+            raise ValueError
+
+    except ValueError:
+        await message.answer(
+            "❌ Введите положительное целое число."
+        )
+        return
+
+    data = await state.get_data()
+    size_id = data["replenish_size_id"]
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE product_sizes
+        SET stock = stock + ?
+        WHERE id = ?
+    """, (quantity, size_id))
+
+    cur.execute("""
+        SELECT size, stock
+        FROM product_sizes
+        WHERE id = ?
+    """, (size_id,))
+
+    row = cur.fetchone()
+
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+
+    if not row:
+        await message.answer(
+            "❌ Размер не найден.",
+            reply_markup=get_menu(message.from_user.id)
+        )
+        return
+
+    await message.answer(
+        "✅ <b>Остаток пополнен!</b>\n\n"
+        f"Размер: <b>{row[0]}</b>\n"
+        f"Добавлено: <b>{quantity} шт.</b>\n"
+        f"Теперь на складе: <b>{row[1]} шт.</b>",
+        reply_markup=get_menu(message.from_user.id)
+    )
+
+
+# =========================================================
+# ПРОДАЖА
+# =========================================================
+
+async def sale_start(message: Message):
+
+    products = get_products()
+
+    if not products:
+        await message.answer("🛒 Товаров пока нет.")
+        return
+
+    buttons = []
+
+    for product_id, name, _, _ in products:
+        buttons.append([
+            InlineKeyboardButton(
+                text=name,
+                callback_data=f"sale_product:{product_id}"
+            )
+        ])
+
+    await message.answer(
+        "🛒 <b>Продажа</b>\n\n"
+        "Выберите товар:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+    )
+
+
+@dp.callback_query(F.data.startswith("sale_product:"))
+async def sale_product(callback: CallbackQuery):
+
+    product_id = int(callback.data.split(":")[1])
+    product = get_product(product_id)
+
+    if not product:
+        await callback.answer(
+            "Товар не найден.",
+            show_alert=True
+        )
+        return
+
+    sizes = get_sizes(product_id)
+
+    buttons = []
+
+    for size_id, size, stock in sizes:
+
+        if stock <= 0:
+            continue
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{size} — {stock} шт.",
+                callback_data=f"sale_size:{size_id}"
+            )
+        ])
+
+    if not buttons:
+        await callback.message.edit_text(
+            f"🛍 <b>{product[1]}</b>\n\n"
+            "❌ Товара нет в наличии."
+        )
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        f"🛍 <b>{product[1]}</b>\n\n"
+        "Выберите размер:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("sale_size:"))
+async def sale_size(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    size_id = int(callback.data.split(":")[1])
+    size = get_size(size_id)
+
+    if not size:
+        await callback.answer(
+            "Размер не найден.",
+            show_alert=True
+        )
+        return
+
+    if size[3] <= 0:
+        await callback.answer(
+            "Товара нет в наличии.",
+            show_alert=True
+        )
+        return
+
+    await state.update_data(
+        sale_size_id=size_id
+    )
+
+    await state.set_state(Sale.quantity)
+
+    await callback.message.edit_text(
+        f"🛒 Размер: <b>{size[2]}</b>\n"
+        f"В наличии: <b>{size[3]} шт.</b>\n\n"
+        "Введите количество:"
+    )
+
+    await callback.answer()
+
+
+@dp.message(Sale.quantity)
+async def sale_quantity(
+    message: Message,
+    state: FSMContext
+):
+
+    try:
+        quantity = int(message.text)
+
+        if quantity <= 0:
+            raise ValueError
+
+    except ValueError:
+        await message.answer(
+            "❌ Введите положительное целое число."
+        )
+        return
+
+    data = await state.get_data()
+    size_id = data["sale_size_id"]
+
+    size = get_size(size_id)
+
+    if not size:
+        await state.clear()
+        await message.answer("❌ Размер не найден.")
+        return
+
+    if quantity > size[3]:
+        await message.answer(
+            f"❌ Недостаточно товара.\n\n"
+            f"В наличии: <b>{size[3]} шт.</b>"
+        )
+        return
+
+    product = get_product(size[1])
+
+    if not product:
+        await state.clear()
+        await message.answer("❌ Товар не найден.")
+        return
+
+    await state.update_data(
+        quantity=quantity,
+        product_id=product[0]
+    )
+
+    await state.set_state(Sale.actual_price)
+
+    await message.answer(
+        f"🛍 <b>{product[1]}</b>\n"
+        f"Размер: <b>{size[2]}</b>\n"
+        f"Количество: <b>{quantity} шт.</b>\n\n"
+        f"Стандартная цена: <b>{money(product[3])}</b>\n\n"
+        "Введите фактическую цену продажи за 1 шт. (₽):"
+    )
+
+
+@dp.message(Sale.actual_price)
+async def sale_actual_price(
+    message: Message,
+    state: FSMContext
+):
+
+    try:
+        actual_price = float(
+            message.text.replace(",", ".")
+        )
+
+        if actual_price < 0:
+            raise ValueError
+
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректную цену.\n"
+            "Например: 2990"
+        )
+        return
+
+    await state.update_data(
+        actual_price=actual_price
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💵 Получена сразу",
+                    callback_data="payment:cash"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📦 Avito Доставка",
+                    callback_data="payment:avito"
+                )
+            ]
+        ]
+    )
+
+    await message.answer(
+        "💳 <b>Способ оплаты</b>\n\n"
+        "Как клиент оплачивает заказ?",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(F.data.startswith("payment:"))
+async def sale_payment(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    payment_method = callback.data.split(":")[1]
+    data = await state.get_data()
+
+    size_id = data["sale_size_id"]
+    quantity = data["quantity"]
+    actual_price = data["actual_price"]
+    product_id = data["product_id"]
+
+    size = get_size(size_id)
+    product = get_product(product_id)
+
+    if not size or not product:
+        await state.clear()
+        await callback.answer(
+            "Ошибка: товар не найден.",
+            show_alert=True
+        )
+        return
+
+    if quantity > size[3]:
+        await state.clear()
+        await callback.answer(
+            "Недостаточно товара.",
+            show_alert=True
+        )
+        return
+
+    purchase_price = product[2]
+
+    total_sale = actual_price * quantity
+    total_purchase = purchase_price * quantity
+    total_profit = total_sale - total_purchase
+
+    if payment_method == "cash":
+        status = "completed"
+    else:
+        status = "pending"
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE product_sizes
+        SET stock = stock - ?
+        WHERE id = ?
+    """, (
+        quantity,
+        size_id
+    ))
+
+    # ВАЖНО:
+    # Теперь сохраняем size_id.
+    # Именно это исправляет проблему возвратов.
+    cur.execute("""
+        INSERT INTO sales (
+            product_id,
+            size_id,
+            product_name,
+            size,
+            quantity,
+            sale_price,
+            purchase_price,
+            profit,
+            payment_method,
+            status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        product_id,
+        size_id,
+        product[1],
+        size[2],
+        quantity,
+        actual_price,
+        purchase_price,
+        total_profit,
+        payment_method,
+        status
+    ))
+
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+
+    if payment_method == "cash":
+
+        await callback.message.edit_text(
+            "✅ <b>Продажа оформлена!</b>\n\n"
+            f"🛍 {product[1]}\n"
+            f"Размер: {size[2]}\n"
+            f"Количество: {quantity} шт.\n"
+            f"Цена: {money(actual_price)} / шт.\n"
+            f"Выручка: {money(total_sale)}\n"
+            f"Прибыль: {money(total_profit)}\n\n"
+            "💵 Оплата получена."
+        )
+
+    else:
+
+        await callback.message.edit_text(
+            "📦 <b>Заказ оформлен через Avito</b>\n\n"
+            f"🛍 {product[1]}\n"
+            f"Размер: {size[2]}\n"
+            f"Количество: {quantity} шт.\n"
+            f"Цена: {money(actual_price)} / шт.\n"
+            f"Выручка: {money(total_sale)}\n"
+            f"Потенциальная прибыль: {money(total_profit)}\n\n"
+            "⏳ Деньги пока не получены.\n"
+            "Заказ добавлен в ожидающие."
+        )
+
+    await callback.answer()
+
+
+# =========================================================
+# СТАТИСТИКА
+# =========================================================
+
+async def show_statistics(message: Message):
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(quantity), 0),
+            COALESCE(SUM(profit), 0)
+        FROM sales
+        WHERE status = 'completed'
+    """)
+
+    completed_count, completed_quantity, completed_profit = cur.fetchone()
+
+    cur.execute("""
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(quantity), 0)
+        FROM sales
+        WHERE status = 'pending'
+    """)
+
+    pending_count, pending_quantity = cur.fetchone()
+
+    cur.execute("""
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(quantity), 0)
+        FROM sales
+        WHERE status = 'returned'
+    """)
+
+    returned_count, returned_quantity = cur.fetchone()
+
+    conn.close()
+
+    text = (
+        "📊 <b>СТАТИСТИКА</b>\n\n"
+        f"✅ Завершённых продаж: <b>{completed_count}</b>\n"
+        f"📦 Продано: <b>{completed_quantity} шт.</b>\n"
+        f"💰 Прибыль: <b>{money(completed_profit)}</b>\n\n"
+        f"⏳ Ожидающих заказов: <b>{pending_count}</b>\n"
+        f"📦 Товаров в ожидании: <b>{pending_quantity} шт.</b>\n\n"
+        f"↩️ Возвратов: <b>{returned_count}</b>\n"
+        f"📦 Возвращено: <b>{returned_quantity} шт.</b>"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="↩️ Возвраты",
+                    callback_data="returns_list"
+                )
+            ]
+        ]
+    )
+
+    await message.answer(
+        text,
+        reply_markup=keyboard
+    )
+
+
+# =========================================================
+# ФИНАНСЫ
+# =========================================================
+
+async def show_profit(message: Message):
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(sale_price * quantity), 0),
+            COALESCE(SUM(purchase_price * quantity), 0),
+            COALESCE(SUM(profit), 0),
+            COALESCE(SUM(quantity), 0)
+        FROM sales
+        WHERE status = 'completed'
+    """)
+
+    completed_revenue, completed_cost, completed_profit, completed_qty = (
+        cur.fetchone()
+    )
+
+    cur.execute("""
+        SELECT
+            COALESCE(SUM(sale_price * quantity), 0),
+            COALESCE(SUM(purchase_price * quantity), 0),
+            COALESCE(SUM(profit), 0),
+            COALESCE(SUM(quantity), 0)
+        FROM sales
+        WHERE status = 'pending'
+    """)
+
+    pending_revenue, pending_cost, pending_profit, pending_qty = (
+        cur.fetchone()
+    )
+
+    cur.execute("""
+        SELECT COALESCE(SUM(quantity), 0)
+        FROM sales
+        WHERE status = 'returned'
+    """)
+
+    returned_qty = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COALESCE(SUM(amount), 0)
+        FROM expenses
+    """)
+
+    expenses = cur.fetchone()[0]
+
+    conn.close()
+
+    net_profit = completed_profit - expenses
+    sold_qty = completed_qty + pending_qty
+
+    text = (
+        "💰 <b>ФИНАНСЫ</b>\n\n"
+        f"💵 Выручка: <b>{money(completed_revenue)}</b>\n"
+        f"📦 Себестоимость: <b>{money(completed_cost)}</b>\n"
+        f"💸 Расходы: <b>{money(expenses)}</b>\n\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        f"💰 Чистая прибыль: <b>{money(net_profit)}</b>\n\n"
+        "⏳ <b>В ОЖИДАНИИ</b>\n\n"
+        f"💵 Выручка: <b>{money(pending_revenue)}</b>\n"
+        f"📈 Прибыль: <b>{money(pending_profit)}</b>\n\n"
+        f"📦 Продано: <b>{sold_qty} шт.</b>\n"
+        f"↩️ Возвраты: <b>{returned_qty} шт.</b>"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить расход",
+                    callback_data="expense_add"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📋 История расходов",
+                    callback_data="expense_history"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⏳ Ожидающие заказы",
+                    callback_data="pending_orders"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="↩️ Возвраты",
+                    callback_data="returns_list"
+                )
+            ]
+        ]
+    )
+
+    await message.answer(
+        text,
+        reply_markup=keyboard
+    )
+
+
+# =========================================================
+# РАСХОДЫ
+# =========================================================
+
+@dp.callback_query(F.data == "expense_add")
+async def add_expense_start(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    await state.clear()
+    await state.set_state(Expense.description)
+
+    await callback.message.edit_text(
+        "💸 <b>Добавление расхода</b>\n\n"
+        "Напишите, на что был расход.\n\n"
+        "Например:\n"
+        "Доставка\n"
+        "Упаковка\n"
+        "Такси"
+    )
+
+    await callback.answer()
+
+
+@dp.message(Expense.description)
+async def expense_description(
+    message: Message,
+    state: FSMContext
+):
+
+    description = message.text.strip()
+
+    if not description:
+        await message.answer(
+            "❌ Напишите описание расхода."
+        )
+        return
+
+    await state.update_data(
+        description=description
+    )
+
+    await state.set_state(Expense.amount)
+
+    await message.answer(
+        "💰 Теперь введите сумму расхода (₽):\n\n"
+        "Например: <code>1500</code>"
+    )
+
+
+@dp.message(Expense.amount)
+async def expense_amount(
+    message: Message,
+    state: FSMContext
+):
+
+    try:
+        amount = float(
+            message.text.replace(",", ".")
+        )
+
+        if amount <= 0:
+            raise ValueError
+
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректную положительную сумму.\n"
+            "Например: 1500"
+        )
+        return
+
+    data = await state.get_data()
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO expenses (
+            description,
+            amount
+        )
+        VALUES (?, ?)
+    """, (
+        data["description"],
+        amount
+    ))
+
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Расход добавлен!</b>\n\n"
+        f"📝 {data['description']}\n"
+        f"💸 Сумма: <b>{money(amount)}</b>",
+        reply_markup=get_menu(message.from_user.id)
+    )
+
+
+# =========================================================
+# ИСТОРИЯ РАСХОДОВ
+# =========================================================
+
+@dp.callback_query(F.data == "expense_history")
+async def expense_history(
+    callback: CallbackQuery
+):
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            description,
+            amount,
+            created_at
+        FROM expenses
+        ORDER BY id DESC
+        LIMIT 20
+    """)
+
+    rows = cur.fetchall()
+
+    cur.execute("""
+        SELECT COALESCE(SUM(amount), 0)
+        FROM expenses
+    """)
+
+    total = cur.fetchone()[0]
+
+    conn.close()
+
+    if not rows:
+
+        await callback.message.edit_text(
+            "📋 <b>История расходов</b>\n\n"
+            "Расходов пока нет.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Назад",
+                            callback_data="back_to_profit"
+                        )
+                    ]
+                ]
+            )
+        )
+
+        await callback.answer()
+        return
+
+    text = "📋 <b>ИСТОРИЯ РАСХОДОВ</b>\n\n"
+
+    for expense_id, description, amount, created_at in rows:
+        text += (
+            f"#{expense_id} — <b>{description}</b>\n"
+            f"💸 {money(amount)}\n"
+            f"🕒 {created_at}\n\n"
+        )
+
+    text += (
+        "━━━━━━━━━━━━━━━━\n"
+        f"💸 <b>Всего расходов: {money(total)}</b>"
+    )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="back_to_profit"
+                    )
+                ]
+            ]
+        )
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# ОЖИДАЮЩИЕ ЗАКАЗЫ
+# =========================================================
+
+@dp.callback_query(F.data == "pending_orders")
+async def pending_orders(
+    callback: CallbackQuery
+):
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            product_name,
+            size,
+            quantity,
+            sale_price,
+            profit,
+            created_at
+        FROM sales
+        WHERE status = 'pending'
+        ORDER BY id DESC
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+
+        await callback.message.edit_text(
+            "⏳ <b>ОЖИДАЮЩИЕ ЗАКАЗЫ</b>\n\n"
+            "Нет заказов, ожидающих получения.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Назад",
+                            callback_data="back_to_profit"
+                        )
+                    ]
+                ]
+            )
+        )
+
+        await callback.answer()
+        return
+
+    text = "⏳ <b>ОЖИДАЮЩИЕ ЗАКАЗЫ</b>\n\n"
+    buttons = []
+
+    for (
+        sale_id,
+        product_name,
+        size,
+        quantity,
+        sale_price,
+        profit,
+        created_at
+    ) in rows:
+
+        total = sale_price * quantity
+
+        text += (
+            f"🆔 Заказ #{sale_id}\n"
+            f"🛍 <b>{product_name}</b>\n"
+            f"Размер: {size}\n"
+            f"Количество: {quantity} шт.\n"
+            f"Выручка: {money(total)}\n"
+            f"Прибыль: {money(profit)}\n"
+            f"🕒 {created_at}\n\n"
+        )
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"📦 Заказ #{sale_id}",
+                callback_data=f"pending_view:{sale_id}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data="back_to_profit"
+        )
+    ])
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# ПРОСМОТР ЗАКАЗА
+# =========================================================
+
+@dp.callback_query(F.data.startswith("pending_view:"))
+async def pending_view(
+    callback: CallbackQuery
+):
+
+    sale_id = int(callback.data.split(":")[1])
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            product_name,
+            size,
+            quantity,
+            sale_price,
+            purchase_price,
+            profit,
+            payment_method,
+            status,
+            created_at
+        FROM sales
+        WHERE id = ?
+    """, (sale_id,))
+
+    sale = cur.fetchone()
+    conn.close()
+
+    if not sale:
+        await callback.answer(
+            "Заказ не найден.",
+            show_alert=True
+        )
+        return
+
+    if sale[8] != "pending":
+        await callback.answer(
+            "Этот заказ уже обработан.",
+            show_alert=True
+        )
+        return
+
+    total_revenue = sale[4] * sale[3]
+
+    text = (
+        f"⏳ <b>ЗАКАЗ #{sale[0]}</b>\n\n"
+        f"🛍 Товар: <b>{sale[1]}</b>\n"
+        f"Размер: <b>{sale[2]}</b>\n"
+        f"Количество: <b>{sale[3]} шт.</b>\n"
+        f"Цена: <b>{money(sale[4])}</b> / шт.\n"
+        f"Выручка: <b>{money(total_revenue)}</b>\n"
+        f"Прибыль: <b>{money(sale[6])}</b>\n\n"
+        "Что произошло с заказом?"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Клиент получил",
+                    callback_data=f"complete_order:{sale_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Возврат",
+                    callback_data=f"return_confirm:{sale_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="pending_orders"
+                )
+            ]
+        ]
+    )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=keyboard
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# ЗАКАЗ ПОЛУЧЕН
+# =========================================================
+
+@dp.callback_query(F.data.startswith("complete_order:"))
+async def complete_order(
+    callback: CallbackQuery
+):
+
+    sale_id = int(callback.data.split(":")[1])
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT status FROM sales WHERE id = ?",
+        (sale_id,)
+    )
+
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        await callback.answer(
+            "Заказ не найден.",
+            show_alert=True
+        )
+        return
+
+    if row[0] != "pending":
+        conn.close()
+        await callback.answer(
+            "Этот заказ уже обработан.",
+            show_alert=True
+        )
+        return
+
+    cur.execute("""
+        UPDATE sales
+        SET status = 'completed'
+        WHERE id = ?
+    """, (sale_id,))
+
+    conn.commit()
+    conn.close()
+
+    await callback.answer(
+        "Заказ отмечен как полученный."
+    )
+
+    await pending_orders(callback)
+
+
+# =========================================================
+# ПОДТВЕРЖДЕНИЕ ВОЗВРАТА
+# =========================================================
+
+@dp.callback_query(F.data.startswith("return_confirm:"))
+async def return_confirm(
+    callback: CallbackQuery
+):
+
+    sale_id = int(callback.data.split(":")[1])
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            product_name,
+            size,
+            quantity,
+            status
+        FROM sales
+        WHERE id = ?
+    """, (sale_id,))
+
+    sale = cur.fetchone()
+    conn.close()
+
+    if not sale:
+        await callback.answer(
+            "Заказ не найден.",
+            show_alert=True
+        )
+        return
+
+    if sale[4] != "pending":
+        await callback.answer(
+            "Этот заказ уже обработан.",
+            show_alert=True
+        )
+        return
+
+    text = (
+        "⚠️ <b>ПОДТВЕРЖДЕНИЕ ВОЗВРАТА</b>\n\n"
+        "Вы уверены, что хотите оформить возврат?\n\n"
+        f"🛍 Товар: <b>{sale[1]}</b>\n"
+        f"Размер: <b>{sale[2]}</b>\n"
+        f"Количество: <b>{sale[3]} шт.</b>\n\n"
+        "Товар будет возвращён на склад."
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Да, оформить возврат",
+                    callback_data=f"return_execute:{sale_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="↩️ Отмена",
+                    callback_data=f"pending_view:{sale_id}"
+                )
+            ]
+        ]
+    )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=keyboard
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# ОФОРМЛЕНИЕ ВОЗВРАТА
+# =========================================================
+
+@dp.callback_query(F.data.startswith("return_execute:"))
+async def return_execute(
+    callback: CallbackQuery
+):
+
+    sale_id = int(callback.data.split(":")[1])
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            product_id,
+            size_id,
+            size,
+            quantity,
+            status
+        FROM sales
+        WHERE id = ?
+    """, (sale_id,))
+
+    sale = cur.fetchone()
+
+    if not sale:
+        conn.close()
+        await callback.answer(
+            "Заказ не найден.",
+            show_alert=True
+        )
+        return
+
+    product_id, size_id, size_name, quantity, status = sale
+
+    if status != "pending":
+        conn.close()
+        await callback.answer(
+            "Этот заказ уже обработан.",
+            show_alert=True
+        )
+        return
+
+    # Сначала используем точный size_id
+    if size_id:
+
+        cur.execute("""
+            SELECT id
+            FROM product_sizes
+            WHERE id = ?
+        """, (size_id,))
+
+        size_row = cur.fetchone()
+
+        if not size_row:
+            conn.close()
+
+            await callback.answer(
+                "Размер товара был удалён. "
+                "Нельзя автоматически вернуть товар на склад.",
+                show_alert=True
+            )
+            return
+
+        cur.execute("""
+            UPDATE product_sizes
+            SET stock = stock + ?
+            WHERE id = ?
+        """, (
+            quantity,
+            size_id
+        ))
+
+    else:
+
+        # Запасной вариант для очень старой продажи
+        cur.execute("""
+            SELECT id
+            FROM product_sizes
+            WHERE product_id = ?
+              AND LOWER(TRIM(size)) = LOWER(TRIM(?))
+            LIMIT 1
+        """, (
+            product_id,
+            size_name
+        ))
+
+        size_row = cur.fetchone()
+
+        if not size_row:
+            conn.close()
+
+            await callback.answer(
+                "Не удалось найти размер товара.",
+                show_alert=True
+            )
+            return
+
+        real_size_id = size_row[0]
+
+        cur.execute("""
+            UPDATE sales
+            SET size_id = ?
+            WHERE id = ?
+        """, (
+            real_size_id,
+            sale_id
+        ))
+
+        cur.execute("""
+            UPDATE product_sizes
+            SET stock = stock + ?
+            WHERE id = ?
+        """, (
+            quantity,
+            real_size_id
+        ))
+
+    cur.execute("""
+        UPDATE sales
+        SET status = 'returned'
+        WHERE id = ?
+    """, (sale_id,))
+
+    conn.commit()
+    conn.close()
+
+    await callback.answer("Возврат оформлен.")
+
+    await pending_orders(callback)
+
+
+# =========================================================
+# СПИСОК ВОЗВРАТОВ
+# =========================================================
+
+@dp.callback_query(F.data == "returns_list")
+async def returns_list(
+    callback: CallbackQuery
+):
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            product_id,
+            product_name,
+            size,
+            quantity,
+            sale_price,
+            created_at
+        FROM sales
+        WHERE status = 'returned'
+        ORDER BY id DESC
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+
+        await callback.message.edit_text(
+            "↩️ <b>ВОЗВРАТЫ</b>\n\n"
+            "Возвратов нет.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Назад",
+                            callback_data="back_to_profit"
+                        )
+                    ]
+                ]
+            )
+        )
+
+        await callback.answer()
+        return
+
+    text = "↩️ <b>ВОЗВРАТЫ</b>\n\n"
+    buttons = []
+
+    for (
+        sale_id,
+        product_id,
+        product_name,
+        size,
+        quantity,
+        sale_price,
+        created_at
+    ) in rows:
+
+        text += (
+            f"🆔 Возврат #{sale_id}\n"
+            f"🛍 <b>{product_name}</b>\n"
+            f"Размер: {size}\n"
+            f"Количество: {quantity} шт.\n"
+            f"Сумма: {money(sale_price * quantity)}\n"
+            f"🕒 {created_at}\n\n"
+        )
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"↩️ Возврат #{sale_id}",
+                callback_data=f"return_undo_confirm:{sale_id}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data="back_to_profit"
+        )
+    ])
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# ОТМЕНА ВОЗВРАТА
+# =========================================================
+
+@dp.callback_query(F.data.startswith("return_undo_confirm:"))
+async def return_undo_confirm(
+    callback: CallbackQuery
+):
+
+    sale_id = int(callback.data.split(":")[1])
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            product_id,
+            size_id,
+            product_name,
+            size,
+            quantity,
+            status
+        FROM sales
+        WHERE id = ?
+    """, (sale_id,))
+
+    sale = cur.fetchone()
+    conn.close()
+
+    if not sale:
+        await callback.answer(
+            "Продажа не найдена.",
+            show_alert=True
+        )
+        return
+
+    product_id, size_id, product_name, size_name, quantity, status = sale
+
+    if status != "returned":
+        await callback.answer(
+            "Этот возврат уже отменён.",
+            show_alert=True
+        )
+        return
+
+    # -----------------------------------------------------
+    # Если size_id уже есть — обычная отмена
+    # -----------------------------------------------------
+
+    if size_id:
+
+        text = (
+            "⚠️ <b>ОТМЕНА ВОЗВРАТА</b>\n\n"
+            f"Товар: <b>{product_name}</b>\n"
+            f"Размер: <b>{size_name}</b>\n"
+            f"Количество: <b>{quantity} шт.</b>\n\n"
+            "Товар будет снова списан со склада,\n"
+            "а возврат исчезнет из статистики.\n\n"
+            "Продолжить?"
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Да, отменить возврат",
+                        callback_data=f"return_undo:{sale_id}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="↩️ Назад",
+                        callback_data="returns_list"
+                    )
+                ]
+            ]
+        )
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=keyboard
+        )
+
+        await callback.answer()
+        return
+
+    # -----------------------------------------------------
+    # СТАРАЯ ПРОДАЖА БЕЗ size_id
+    #
+    # Ищем размер по тексту.
+    # -----------------------------------------------------
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, size, stock
+        FROM product_sizes
+        WHERE product_id = ?
+          AND LOWER(TRIM(size)) = LOWER(TRIM(?))
+    """, (
+        product_id,
+        size_name
+    ))
+
+    exact = cur.fetchone()
+
+    if exact:
+        conn.close()
+
+        text = (
+            "⚠️ <b>ОТМЕНА ВОЗВРАТА</b>\n\n"
+            f"Товар: <b>{product_name}</b>\n"
+            f"Размер: <b>{exact[1]}</b>\n"
+            f"Количество: <b>{quantity} шт.</b>\n\n"
+            "Возврат будет убран из статистики,\n"
+            "а товар снова будет считаться проданным.\n\n"
+            "Продолжить?"
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Да, отменить возврат",
+                        callback_data=f"return_undo:{sale_id}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="↩️ Назад",
+                        callback_data="returns_list"
+                    )
+                ]
+            ]
+        )
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=keyboard
+        )
+
+        await callback.answer()
+        return
+
+    # -----------------------------------------------------
+    # Если старый размер не найден:
+    # предлагаем выбрать существующий размер вручную
+    # -----------------------------------------------------
+
+    cur.execute("""
+        SELECT id, size, stock
+        FROM product_sizes
+        WHERE product_id = ?
+        ORDER BY id
+    """, (product_id,))
+
+    sizes = cur.fetchall()
+    conn.close()
+
+    if not sizes:
+
+        await callback.answer(
+            "У товара вообще нет размеров. "
+            "Добавьте размер товара и повторите.",
+            show_alert=True
+        )
+        return
+
+    text = (
+        "⚠️ <b>СТАРЫЙ ВОЗВРАТ</b>\n\n"
+        f"Товар: <b>{product_name}</b>\n"
+        f"Старый размер: <b>{size_name}</b>\n"
+        f"Количество: <b>{quantity} шт.</b>\n\n"
+        "Старый размер не удалось автоматически найти.\n"
+        "Выберите размер, с которого нужно списать "
+        "товар при отмене возврата:"
+    )
+
+    buttons = []
+
+    for current_size_id, current_size, stock in sizes:
+
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{current_size} — {stock} шт.",
+                callback_data=(
+                    f"return_undo_size:"
+                    f"{sale_id}:{current_size_id}"
+                )
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="↩️ Назад",
+            callback_data="returns_list"
+        )
+    ])
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# ВЫБОР РАЗМЕРА ДЛЯ СТАРОГО ВОЗВРАТА
+# =========================================================
+
+@dp.callback_query(F.data.startswith("return_undo_size:"))
+async def return_undo_size(
+    callback: CallbackQuery
+):
+
+    parts = callback.data.split(":")
+
+    sale_id = int(parts[1])
+    size_id = int(parts[2])
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            product_name,
+            size,
+            quantity,
+            status
+        FROM sales
+        WHERE id = ?
+    """, (sale_id,))
+
+    sale = cur.fetchone()
+
+    cur.execute("""
+        SELECT
+            size,
+            stock
+        FROM product_sizes
+        WHERE id = ?
+    """, (size_id,))
+
+    size_row = cur.fetchone()
+
+    conn.close()
+
+    if not sale or not size_row:
+        await callback.answer(
+            "Данные не найдены.",
+            show_alert=True
+        )
+        return
+
+    if sale[3] != "returned":
+        await callback.answer(
+            "Этот возврат уже обработан.",
+            show_alert=True
+        )
+        return
+
+    product_name, old_size, quantity, _ = sale
+    new_size, stock = size_row
+
+    text = (
+        "⚠️ <b>ПОДТВЕРЖДЕНИЕ</b>\n\n"
+        f"Товар: <b>{product_name}</b>\n"
+        f"Количество: <b>{quantity} шт.</b>\n\n"
+        f"Старый размер: <b>{old_size}</b>\n"
+        f"Выбранный размер: <b>{new_size}</b>\n"
+        f"Сейчас на складе: <b>{stock} шт.</b>\n\n"
+        "При отмене возврата это количество "
+        "будет списано с выбранного размера.\n\n"
+        "Продолжить?"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Да, отменить",
+                    callback_data=(
+                        f"return_undo_force:"
+                        f"{sale_id}:{size_id}"
+                    )
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="↩️ Назад",
+                    callback_data=f"return_undo_confirm:{sale_id}"
+                )
+            ]
+        ]
+    )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=keyboard
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# ОТМЕНА ВОЗВРАТА
+# =========================================================
+
+@dp.callback_query(F.data.startswith("return_undo_force:"))
+async def return_undo_force(
+    callback: CallbackQuery
+):
+
+    parts = callback.data.split(":")
+
+    sale_id = int(parts[1])
+    size_id = int(parts[2])
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            quantity,
+            status
+        FROM sales
+        WHERE id = ?
+    """, (sale_id,))
+
+    sale = cur.fetchone()
+
+    if not sale:
+        conn.close()
+        await callback.answer(
+            "Продажа не найдена.",
+            show_alert=True
+        )
+        return
+
+    quantity, status = sale
+
+    if status != "returned":
+        conn.close()
+        await callback.answer(
+            "Этот возврат уже отменён.",
+            show_alert=True
+        )
+        return
+
+    cur.execute("""
+        SELECT stock
+        FROM product_sizes
+        WHERE id = ?
+    """, (size_id,))
+
+    size_row = cur.fetchone()
+
+    if not size_row:
+        conn.close()
+        await callback.answer(
+            "Размер больше не существует.",
+            show_alert=True
+        )
+        return
+
+    current_stock = size_row[0]
+
+    if current_stock < quantity:
+        conn.close()
+        await callback.answer(
+            "Нельзя отменить возврат: "
+            "на выбранном размере недостаточно товара.",
+            show_alert=True
+        )
+        return
+
+    cur.execute("""
+        UPDATE product_sizes
+        SET stock = stock - ?
+        WHERE id = ?
+    """, (
+        quantity,
+        size_id
+    ))
+
+    cur.execute("""
+        UPDATE sales
+        SET
+            status = 'completed',
+            size_id = ?
+        WHERE id = ?
+    """, (
+        size_id,
+        sale_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+    await callback.answer(
+        "Возврат отменён."
+    )
+
+    await returns_list(callback)
+
+
+# Обычная отмена возврата для новых продаж
+@dp.callback_query(F.data.startswith("return_undo:"))
+async def return_undo(
+    callback: CallbackQuery
+):
+
+    sale_id = int(callback.data.split(":")[1])
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            size_id,
+            quantity,
+            status
+        FROM sales
+        WHERE id = ?
+    """, (sale_id,))
+
+    sale = cur.fetchone()
+
+    if not sale:
+        conn.close()
+        await callback.answer(
+            "Продажа не найдена.",
+            show_alert=True
+        )
+        return
+
+    size_id, quantity, status = sale
+
+    if status != "returned":
+        conn.close()
+        await callback.answer(
+            "Этот возврат уже отменён.",
+            show_alert=True
+        )
+        return
+
+    if not size_id:
+        conn.close()
+
+        await callback.answer(
+            "Для старого возврата нужно выбрать размер.",
+            show_alert=True
+        )
+
+        return
+
+    cur.execute("""
+        SELECT stock
+        FROM product_sizes
+        WHERE id = ?
+    """, (size_id,))
+
+    stock_row = cur.fetchone()
+
+    if not stock_row:
+        conn.close()
+
+        await callback.answer(
+            "Размер товара больше не существует.",
+            show_alert=True
+        )
+        return
+
+    current_stock = stock_row[0]
+
+    if current_stock < quantity:
+        conn.close()
+
+        await callback.answer(
+            "Нельзя отменить возврат: "
+            "на складе недостаточно товара.",
+            show_alert=True
+        )
+        return
+
+    cur.execute("""
+        UPDATE product_sizes
+        SET stock = stock - ?
+        WHERE id = ?
+    """, (
+        quantity,
+        size_id
+    ))
+
+    cur.execute("""
+        UPDATE sales
+        SET status = 'completed'
+        WHERE id = ?
+    """, (sale_id,))
+
+    conn.commit()
+    conn.close()
+
+    await callback.answer(
+        "Возврат отменён."
+    )
+
+    await returns_list(callback)
+
+
+# =========================================================
+# НАЗАД В ФИНАНСЫ
+# =========================================================
+
+@dp.callback_query(F.data == "back_to_profit")
+async def back_to_profit(
+    callback: CallbackQuery
+):
+
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    await show_profit(callback.message)
+
+    await callback.answer()
+
+
+# =========================================================
+# ИЗМЕНЕНИЕ ТОВАРА
+# =========================================================
+
+async def edit_product_start(message: Message):
+
+    products = get_products()
+
+    if not products:
+        await message.answer("✏️ Товаров пока нет.")
+        return
+
+    buttons = []
+
+    for product_id, name, _, _ in products:
+        buttons.append([
+            InlineKeyboardButton(
+                text=name,
+                callback_data=f"edit_product:{product_id}"
+            )
+        ])
+
+    await message.answer(
+        "✏️ <b>Изменение товара</b>\n\n"
+        "Выберите товар:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+    )
+
+
+@dp.callback_query(F.data.startswith("edit_product:"))
+async def edit_product_select(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    product_id = int(callback.data.split(":")[1])
+    product = get_product(product_id)
+
+    if not product:
+        await callback.answer(
+            "Товар не найден.",
+            show_alert=True
+        )
+        return
+
+    await state.update_data(
+        edit_product_id=product_id
+    )
+
+    await state.set_state(EditProduct.name)
+
+    await callback.message.edit_text(
+        f"✏️ <b>Изменение товара</b>\n\n"
+        f"Текущее название: <b>{product[1]}</b>\n\n"
+        "Введите новое название:"
+    )
+
+    await callback.answer()
+
+
+@dp.message(EditProduct.name)
+async def edit_product_name(
+    message: Message,
+    state: FSMContext
+):
+
+    name = message.text.strip()
+
+    if not name:
+        await message.answer("Введите название.")
+        return
+
+    await state.update_data(new_name=name)
+    await state.set_state(EditProduct.purchase_price)
+
+    await message.answer(
+        "Введите новую закупочную цену (₽):"
+    )
+
+
+@dp.message(EditProduct.purchase_price)
+async def edit_product_purchase(
+    message: Message,
+    state: FSMContext
+):
+
+    try:
+        price = float(
+            message.text.replace(",", ".")
+        )
+
+        if price < 0:
+            raise ValueError
+
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректную цену."
+        )
+        return
+
+    await state.update_data(
+        new_purchase_price=price
+    )
+
+    await state.set_state(EditProduct.sale_price)
+
+    await message.answer(
+        "Введите новую цену продажи (₽):"
+    )
+
+
+@dp.message(EditProduct.sale_price)
+async def edit_product_sale(
+    message: Message,
+    state: FSMContext
+):
+
+    try:
+        price = float(
+            message.text.replace(",", ".")
+        )
+
+        if price < 0:
+            raise ValueError
+
+    except ValueError:
+        await message.answer(
+            "❌ Введите корректную цену."
+        )
+        return
+
+    data = await state.get_data()
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE products
+        SET
+            name = ?,
+            purchase_price = ?,
+            sale_price = ?
+        WHERE id = ?
+    """, (
+        data["new_name"],
+        data["new_purchase_price"],
+        price,
+        data["edit_product_id"]
+    ))
+
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Товар изменён!</b>\n\n"
+        f"🛍 {data['new_name']}\n"
+        f"Закупка: {money(data['new_purchase_price'])}\n"
+        f"Продажа: {money(price)}",
+        reply_markup=get_menu(message.from_user.id)
+    )
+
+
+# =========================================================
+# УДАЛЕНИЕ ТОВАРА
+# =========================================================
+
+async def delete_product_start(message: Message):
+
+    products = get_products()
+
+    if not products:
+        await message.answer("🗑️ Товаров пока нет.")
+        return
+
+    buttons = []
+
+    for product_id, name, _, _ in products:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🗑️ {name}",
+                callback_data=f"delete_product:{product_id}"
+            )
+        ])
+
+    await message.answer(
+        "🗑️ <b>Удаление товара</b>\n\n"
+        "Выберите товар:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+    )
+
+
+@dp.callback_query(F.data.startswith("delete_product:"))
+async def delete_product_confirm(
+    callback: CallbackQuery
+):
+
+    product_id = int(callback.data.split(":")[1])
+    product = get_product(product_id)
+
+    if not product:
+        await callback.answer(
+            "Товар не найден.",
+            show_alert=True
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Да, удалить",
+                    callback_data=f"delete_execute:{product_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="↩️ Отмена",
+                    callback_data="delete_cancel"
+                )
+            ]
+        ]
+    )
+
+    await callback.message.edit_text(
+        "⚠️ <b>Удаление товара</b>\n\n"
+        f"Вы уверены, что хотите удалить:\n"
+        f"<b>{product[1]}</b>?\n\n"
+        "Остатки товара будут удалены.\n"
+        "История продаж сохранится.",
+        reply_markup=keyboard
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("delete_execute:"))
+async def delete_product_execute(
+    callback: CallbackQuery
+):
+
+    product_id = int(callback.data.split(":")[1])
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT name
+        FROM products
+        WHERE id = ?
+    """, (product_id,))
+
+    product = cur.fetchone()
+
+    if not product:
+        conn.close()
+        await callback.answer(
+            "Товар уже удалён.",
+            show_alert=True
+        )
+        return
+
+    name = product[0]
+
+    cur.execute("""
+        DELETE FROM products
+        WHERE id = ?
+    """, (product_id,))
+
+    conn.commit()
+    conn.close()
+
+    await callback.message.edit_text(
+        f"✅ Товар <b>{name}</b> удалён."
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "delete_cancel")
+async def delete_cancel(
+    callback: CallbackQuery
+):
+
+    await callback.message.edit_text(
+        "↩️ Удаление отменено."
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# ДОСТУП
+# =========================================================
+
+async def access_start(
+    message: Message,
+    state: FSMContext
+):
+
+    if message.from_user.id != ADMIN_ID:
+        await message.answer(
+            "⛔ Только для администратора."
         )
         return
 
@@ -398,75 +2993,67 @@ async def access_menu(
                     text="👥 Список сотрудников",
                     callback_data="access_list"
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🗑️ Удалить сотрудника",
-                    callback_data="access_remove"
-                )
-            ],
+            ]
         ]
     )
 
     await message.answer(
-        "🔐 <b>Управление доступом</b>\n\n"
+        "🔐 <b>УПРАВЛЕНИЕ ДОСТУПОМ</b>\n\n"
         "Выберите действие:",
         reply_markup=keyboard
     )
 
 
 @dp.callback_query(F.data == "access_add")
-async def access_add_start(
+async def access_add(
     callback: CallbackQuery,
     state: FSMContext
 ):
 
-    if not is_admin(callback.from_user.id):
-
+    if callback.from_user.id != ADMIN_ID:
         await callback.answer(
-            "⛔ Нет доступа.",
+            "⛔ Только для администратора.",
             show_alert=True
         )
         return
 
-    await state.set_state(
-        AccessControl.add_user_id
-    )
+    await state.set_state(Access.user_id)
 
-    await callback.message.answer(
-        "Введите Telegram ID сотрудника:"
+    await callback.message.edit_text(
+        "➕ <b>Добавление сотрудника</b>\n\n"
+        "Введите Telegram ID пользователя.\n\n"
+        "Например:\n"
+        "<code>123456789</code>"
     )
 
     await callback.answer()
 
 
-@dp.message(AccessControl.add_user_id)
-async def access_add_user(
+@dp.message(Access.user_id)
+async def access_user_id(
     message: Message,
     state: FSMContext
 ):
 
+    if message.from_user.id != ADMIN_ID:
+        await state.clear()
+        return
+
     try:
-
-        user_id = int(
-            message.text.strip()
-        )
-
+        user_id = int(message.text.strip())
     except ValueError:
-
         await message.answer(
-            "❌ Telegram ID должен состоять только из цифр.\n\n"
-            "Например: <code>123456789</code>"
+            "❌ Telegram ID должен состоять из цифр."
         )
         return
 
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute(
-        "INSERT OR IGNORE INTO allowed_users (user_id) VALUES (?)",
-        (user_id,)
-    )
+    cur.execute("""
+        INSERT OR IGNORE INTO allowed_users (user_id)
+        VALUES (?)
+    """, (user_id,))
 
     conn.commit()
     conn.close()
@@ -474,7 +3061,10 @@ async def access_add_user(
     await state.clear()
 
     await message.answer(
-        f"✅ Пользователь <code>{user_id}</code> получил доступ.",
+        "✅ <b>Доступ добавлен!</b>\n\n"
+        f"Telegram ID: <code>{user_id}</code>\n\n"
+        "Теперь этот пользователь должен открыть бота "
+        "и нажать /start.",
         reply_markup=get_menu(message.from_user.id)
     )
 
@@ -484,10 +3074,9 @@ async def access_list(
     callback: CallbackQuery
 ):
 
-    if not is_admin(callback.from_user.id):
-
+    if callback.from_user.id != ADMIN_ID:
         await callback.answer(
-            "⛔ Нет доступа.",
+            "⛔ Только для администратора.",
             show_alert=True
         )
         return
@@ -495,137 +3084,81 @@ async def access_list(
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute(
-        "SELECT user_id FROM allowed_users ORDER BY user_id"
-    )
-
-    users = cur.fetchall()
-
-    conn.close()
-
-    if not users:
-
-        text = "👥 Сотрудников пока нет."
-
-    else:
-
-        lines = [
-            "👥 <b>Пользователи с доступом:</b>\n"
-        ]
-
-        for user in users:
-
-            uid = user["user_id"]
-
-            if uid == ADMIN_ID:
-
-                lines.append(
-                    f"👑 <code>{uid}</code> — администратор"
-                )
-
-            else:
-
-                lines.append(
-                    f"👤 <code>{uid}</code>"
-                )
-
-        text = "\n".join(lines)
-
-    await callback.message.answer(text)
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "access_remove")
-async def access_remove_menu(
-    callback: CallbackQuery
-):
-
-    if not is_admin(callback.from_user.id):
-
-        await callback.answer(
-            "⛔ Нет доступа.",
-            show_alert=True
-        )
-        return
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT user_id
+    cur.execute("""
+        SELECT user_id, created_at
         FROM allowed_users
-        WHERE user_id != ?
-        """,
-        (ADMIN_ID,)
-    )
+        ORDER BY created_at DESC
+    """)
 
     users = cur.fetchall()
-
     conn.close()
 
     if not users:
 
-        await callback.message.answer(
-            "👥 Нет сотрудников, которых можно удалить."
+        await callback.message.edit_text(
+            "👥 <b>Сотрудников нет.</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ Назад",
+                            callback_data="access_back"
+                        )
+                    ]
+                ]
+            )
         )
 
         await callback.answer()
-
         return
 
+    text = "👥 <b>СОТРУДНИКИ</b>\n\n"
     buttons = []
 
-    for user in users:
+    for user_id, created_at in users:
 
-        uid = user["user_id"]
+        text += (
+            f"👤 <code>{user_id}</code>\n"
+            f"🕒 {created_at}\n\n"
+        )
 
         buttons.append([
             InlineKeyboardButton(
-                text=f"🗑️ {uid}",
-                callback_data=f"access_delete:{uid}"
+                text=f"🗑️ Удалить {user_id}",
+                callback_data=f"access_remove:{user_id}"
             )
         ])
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
+    buttons.append([
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data="access_back"
+        )
+    ])
 
-    await callback.message.answer(
-        "Выберите сотрудника для удаления:",
-        reply_markup=keyboard
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
     )
 
     await callback.answer()
 
 
-@dp.callback_query(
-    F.data.startswith("access_delete:")
-)
-async def access_delete_user(
+@dp.callback_query(F.data.startswith("access_remove:"))
+async def access_remove(
     callback: CallbackQuery
 ):
 
-    if not is_admin(callback.from_user.id):
-
+    if callback.from_user.id != ADMIN_ID:
         await callback.answer(
-            "⛔ Нет доступа.",
+            "⛔ Только для администратора.",
             show_alert=True
         )
         return
 
-    user_id = int(
-        callback.data.split(":")[1]
-    )
-
-    if user_id == ADMIN_ID:
-
-        await callback.answer(
-            "❌ Нельзя удалить администратора.",
-            show_alert=True
-        )
-        return
+    user_id = int(callback.data.split(":")[1])
 
     conn = get_db()
     cur = conn.cursor()
@@ -638,1467 +3171,49 @@ async def access_delete_user(
     conn.commit()
     conn.close()
 
-    await callback.message.answer(
-        f"✅ Доступ пользователя <code>{user_id}</code> удалён."
-    )
+    await callback.answer("Доступ удалён.")
 
-    await callback.answer()
+    await access_list(callback)
 
 
-# =========================================================
-# SHOW PRODUCTS
-# =========================================================
-
-async def show_products(
-    message: Message
-):
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT * FROM products ORDER BY id DESC"
-    )
-
-    products = cur.fetchall()
-
-    if not products:
-
-        conn.close()
-
-        await message.answer(
-            "📦 <b>Товаров пока нет.</b>"
-        )
-
-        return
-
-    text = "📦 <b>Наличие товаров:</b>\n\n"
-
-    for product in products:
-
-        cur.execute(
-            """
-            SELECT size, stock
-            FROM product_sizes
-            WHERE product_id = ?
-            ORDER BY id
-            """,
-            (product["id"],)
-        )
-
-        sizes = cur.fetchall()
-
-        text += (
-            f"🛍️ <b>{product['name']}</b>\n"
-            f"Закупка: {product['purchase_price']:.2f}\n"
-            f"Продажа: {product['sale_price']:.2f}\n"
-        )
-
-        if sizes:
-
-            for size in sizes:
-
-                text += (
-                    f"  • {size['size']}: "
-                    f"<b>{size['stock']} шт.</b>\n"
-                )
-
-        else:
-
-            text += (
-                "  • Размеры не добавлены\n"
-            )
-
-        text += "\n"
-
-    conn.close()
-
-    await message.answer(text)
-
-
-# =========================================================
-# ADD PRODUCT
-# =========================================================
-
-class AddProduct(StatesGroup):
-
-    name = State()
-    purchase_price = State()
-    sale_price = State()
-    sizes = State()
-    stock = State()
-
-
-async def add_product_start(
-    message: Message,
-    state: FSMContext
-):
-
-    await state.clear()
-
-    await state.set_state(
-        AddProduct.name
-    )
-
-    await message.answer(
-        "➕ <b>Добавление товара</b>\n\n"
-        "Введите название товара:"
-    )
-
-
-@dp.message(AddProduct.name)
-async def add_product_name(
-    message: Message,
-    state: FSMContext
-):
-
-    await state.update_data(
-        name=message.text.strip()
-    )
-
-    await state.set_state(
-        AddProduct.purchase_price
-    )
-
-    await message.answer(
-        "Введите закупочную цену:"
-    )
-
-
-@dp.message(AddProduct.purchase_price)
-async def add_product_purchase_price(
-    message: Message,
-    state: FSMContext
-):
-
-    try:
-
-        price = float(
-            message.text.replace(",", ".")
-        )
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Введите число.\n"
-            "Например: <code>10.50</code>"
-        )
-
-        return
-
-    if price < 0:
-
-        await message.answer(
-            "❌ Цена не может быть отрицательной."
-        )
-
-        return
-
-    await state.update_data(
-        purchase_price=price
-    )
-
-    await state.set_state(
-        AddProduct.sale_price
-    )
-
-    await message.answer(
-        "Введите цену продажи:"
-    )
-
-
-@dp.message(AddProduct.sale_price)
-async def add_product_sale_price(
-    message: Message,
-    state: FSMContext
-):
-
-    try:
-
-        price = float(
-            message.text.replace(",", ".")
-        )
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Введите число."
-        )
-
-        return
-
-    if price < 0:
-
-        await message.answer(
-            "❌ Цена не может быть отрицательной."
-        )
-
-        return
-
-    await state.update_data(
-        sale_price=price
-    )
-
-    await state.set_state(
-        AddProduct.sizes
-    )
-
-    await message.answer(
-        "Введите размеры через запятую.\n\n"
-        "Например:\n"
-        "<code>S, M, L, XL</code>"
-    )
-
-
-# =========================================================
-# РАЗМЕРЫ
-# =========================================================
-
-@dp.message(AddProduct.sizes)
-async def add_product_sizes(
-    message: Message,
-    state: FSMContext
-):
-
-    sizes = [
-        size.strip()
-        for size in message.text.split(",")
-        if size.strip()
-    ]
-
-    if not sizes:
-
-        await message.answer(
-            "❌ Укажите хотя бы один размер."
-        )
-
-        return
-
-    # Сохраняем размеры
-    # и начинаем спрашивать остатки по одному
-    await state.update_data(
-        sizes=sizes,
-        current_size_index=0,
-        stocks=[]
-    )
-
-    await state.set_state(
-        AddProduct.stock
-    )
-
-    await message.answer(
-        f"Введите остаток для размера "
-        f"<b>{sizes[0]}</b>:"
-    )
-
-
-# =========================================================
-# ОСТАТОК КАЖДОГО РАЗМЕРА ОТДЕЛЬНО
-# =========================================================
-
-@dp.message(AddProduct.stock)
-async def add_product_stock(
-    message: Message,
-    state: FSMContext
-):
-
-    data = await state.get_data()
-
-    sizes = data["sizes"]
-
-    current_index = data.get(
-        "current_size_index",
-        0
-    )
-
-    stocks = data.get(
-        "stocks",
-        []
-    )
-
-    current_size = sizes[current_index]
-
-    # Проверяем остаток
-    try:
-
-        stock = int(
-            message.text.strip()
-        )
-
-    except ValueError:
-
-        await message.answer(
-            f"❌ Введите целое число.\n\n"
-            f"Остаток для размера "
-            f"<b>{current_size}</b>:"
-        )
-
-        return
-
-    if stock < 0:
-
-        await message.answer(
-            "❌ Остаток не может быть отрицательным.\n\n"
-            f"Введите остаток для размера "
-            f"<b>{current_size}</b>:"
-        )
-
-        return
-
-    # Сохраняем остаток текущего размера
-    stocks.append(stock)
-
-    # Переходим к следующему размеру
-    next_index = current_index + 1
-
-    if next_index < len(sizes):
-
-        await state.update_data(
-            stocks=stocks,
-            current_size_index=next_index
-        )
-
-        await message.answer(
-            f"Введите остаток для размера "
-            f"<b>{sizes[next_index]}</b>:"
-        )
-
-        return
-
-    # =====================================================
-    # ВСЕ РАЗМЕРЫ ГОТОВЫ
-    # =====================================================
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO products
-        (
-            name,
-            purchase_price,
-            sale_price
-        )
-        VALUES (?, ?, ?)
-        """,
-        (
-            data["name"],
-            data["purchase_price"],
-            data["sale_price"]
-        )
-    )
-
-    product_id = cur.lastrowid
-
-    # Добавляем каждый размер
-    # с его отдельным остатком
-    for size, size_stock in zip(
-        sizes,
-        stocks
-    ):
-
-        cur.execute(
-            """
-            INSERT INTO product_sizes
-            (
-                product_id,
-                size,
-                stock
-            )
-            VALUES (?, ?, ?)
-            """,
-            (
-                product_id,
-                size,
-                size_stock
-            )
-        )
-
-    conn.commit()
-    conn.close()
-
-    await state.clear()
-
-    await message.answer(
-        "✅ <b>Товар добавлен.</b>",
-        reply_markup=get_menu(
-            message.from_user.id
-        )
-    )
-
-
-# =========================================================
-# ADD STOCK
-# =========================================================
-
-class AddStock(StatesGroup):
-
-    product = State()
-    size = State()
-    quantity = State()
-
-
-async def add_stock_start(
-    message: Message,
-    state: FSMContext
-):
-
-    await state.clear()
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT id, name
-        FROM products
-        ORDER BY name
-        """
-    )
-
-    products = cur.fetchall()
-
-    conn.close()
-
-    if not products:
-
-        await message.answer(
-            "📦 Нет товаров для пополнения."
-        )
-
-        return
-
-    buttons = []
-
-    for product in products:
-
-        buttons.append([
-            InlineKeyboardButton(
-                text=product["name"],
-                callback_data=f"stock_product:{product['id']}"
-            )
-        ])
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
-
-    await state.set_state(
-        AddStock.product
-    )
-
-    await message.answer(
-        "📥 Выберите товар:",
-        reply_markup=keyboard
-    )
-
-
-@dp.callback_query(
-    F.data.startswith("stock_product:")
-)
-async def add_stock_product(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    product_id = int(
-        callback.data.split(":")[1]
-    )
-
-    await state.update_data(
-        product_id=product_id
-    )
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT size, stock
-        FROM product_sizes
-        WHERE product_id = ?
-        """,
-        (product_id,)
-    )
-
-    sizes = cur.fetchall()
-
-    conn.close()
-
-    if not sizes:
-
-        await callback.message.answer(
-            "❌ У этого товара нет размеров."
-        )
-
-        await state.clear()
-
-        await callback.answer()
-
-        return
-
-    buttons = []
-
-    for size in sizes:
-
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{size['size']} — {size['stock']} шт.",
-                callback_data=f"stock_size:{size['size']}"
-            )
-        ])
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
-
-    await state.set_state(
-        AddStock.size
-    )
-
-    await callback.message.answer(
-        "Выберите размер:",
-        reply_markup=keyboard
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("stock_size:")
-)
-async def add_stock_size(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    size = callback.data.split(
-        ":",
-        1
-    )[1]
-
-    await state.update_data(
-        size=size
-    )
-
-    await state.set_state(
-        AddStock.quantity
-    )
-
-    await callback.message.answer(
-        f"Введите количество, которое нужно "
-        f"добавить для размера <b>{size}</b>:"
-    )
-
-    await callback.answer()
-
-
-@dp.message(AddStock.quantity)
-async def add_stock_quantity(
-    message: Message,
-    state: FSMContext
-):
-
-    try:
-
-        quantity = int(
-            message.text
-        )
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Введите целое число."
-        )
-
-        return
-
-    if quantity <= 0:
-
-        await message.answer(
-            "❌ Количество должно быть больше нуля."
-        )
-
-        return
-
-    data = await state.get_data()
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        UPDATE product_sizes
-        SET stock = stock + ?
-        WHERE product_id = ?
-        AND size = ?
-        """,
-        (
-            quantity,
-            data["product_id"],
-            data["size"]
-        )
-    )
-
-    conn.commit()
-    conn.close()
-
-    await state.clear()
-
-    await message.answer(
-        f"✅ Остаток увеличен на "
-        f"<b>{quantity}</b> шт.",
-        reply_markup=get_menu(
-            message.from_user.id
-        )
-    )
-
-
-# =========================================================
-# SALE
-# =========================================================
-
-class Sale(StatesGroup):
-
-    product = State()
-    size = State()
-    quantity = State()
-    sale_price = State()
-
-
-async def sale_start(
-    message: Message,
-    state: FSMContext
-):
-
-    await state.clear()
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT id, name
-        FROM products
-        ORDER BY name
-        """
-    )
-
-    products = cur.fetchall()
-
-    conn.close()
-
-    if not products:
-
-        await message.answer(
-            "🛒 Нет товаров для продажи."
-        )
-
-        return
-
-    buttons = []
-
-    for product in products:
-
-        buttons.append([
-            InlineKeyboardButton(
-                text=product["name"],
-                callback_data=f"sale_product:{product['id']}"
-            )
-        ])
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
-
-    await state.set_state(
-        Sale.product
-    )
-
-    await message.answer(
-        "🛒 <b>Продажа</b>\n\n"
-        "Выберите товар:",
-        reply_markup=keyboard
-    )
-
-
-@dp.callback_query(
-    F.data.startswith("sale_product:")
-)
-async def sale_product(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    product_id = int(
-        callback.data.split(":")[1]
-    )
-
-    await state.update_data(
-        product_id=product_id
-    )
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT size, stock
-        FROM product_sizes
-        WHERE product_id = ?
-        """,
-        (product_id,)
-    )
-
-    sizes = cur.fetchall()
-
-    conn.close()
-
-    if not sizes:
-
-        await callback.message.answer(
-            "❌ У этого товара нет размеров."
-        )
-
-        await state.clear()
-
-        await callback.answer()
-
-        return
-
-    buttons = []
-
-    for size in sizes:
-
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"{size['size']} — {size['stock']} шт.",
-                callback_data=f"sale_size:{size['size']}"
-            )
-        ])
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
-
-    await state.set_state(
-        Sale.size
-    )
-
-    await callback.message.answer(
-        "Выберите размер:",
-        reply_markup=keyboard
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(
-    F.data.startswith("sale_size:")
-)
-async def sale_size(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    size = callback.data.split(
-        ":",
-        1
-    )[1]
-
-    await state.update_data(
-        size=size
-    )
-
-    await state.set_state(
-        Sale.quantity
-    )
-
-    await callback.message.answer(
-        f"Введите количество проданного товара "
-        f"размера <b>{size}</b>:"
-    )
-
-    await callback.answer()
-
-
-@dp.message(Sale.quantity)
-async def sale_quantity(
-    message: Message,
-    state: FSMContext
-):
-
-    try:
-
-        quantity = int(
-            message.text
-        )
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Введите целое число."
-        )
-
-        return
-
-    if quantity <= 0:
-
-        await message.answer(
-            "❌ Количество должно быть больше нуля."
-        )
-
-        return
-
-    data = await state.get_data()
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT stock
-        FROM product_sizes
-        WHERE product_id = ?
-        AND size = ?
-        """,
-        (
-            data["product_id"],
-            data["size"]
-        )
-    )
-
-    result = cur.fetchone()
-
-    conn.close()
-
-    if not result:
-
-        await message.answer(
-            "❌ Размер не найден."
-        )
-
-        return
-
-    if result["stock"] < quantity:
-
-        await message.answer(
-            f"❌ Недостаточно товара.\n\n"
-            f"На складе: "
-            f"<b>{result['stock']}</b> шт."
-        )
-
-        return
-
-    await state.update_data(
-        quantity=quantity
-    )
-
-    await state.set_state(
-        Sale.sale_price
-    )
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT name, sale_price
-        FROM products
-        WHERE id = ?
-        """,
-        (data["product_id"],)
-    )
-
-    product = cur.fetchone()
-
-    conn.close()
-
-    await message.answer(
-        f"💰 Стандартная цена продажи: "
-        f"<b>{product['sale_price']:.2f}</b>\n\n"
-        "Укажите фактическую стоимость продажи "
-        "за 1 единицу:"
-    )
-
-
-@dp.message(Sale.sale_price)
-async def sale_price(
-    message: Message,
-    state: FSMContext
-):
-
-    try:
-
-        price = float(
-            message.text.replace(",", ".")
-        )
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Введите число.\n"
-            "Например: <code>25.50</code>"
-        )
-
-        return
-
-    if price < 0:
-
-        await message.answer(
-            "❌ Цена не может быть отрицательной."
-        )
-
-        return
-
-    data = await state.get_data()
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    # Получаем товар
-    cur.execute(
-        """
-        SELECT name, purchase_price
-        FROM products
-        WHERE id = ?
-        """,
-        (data["product_id"],)
-    )
-
-    product = cur.fetchone()
-
-    if not product:
-
-        conn.close()
-
-        await state.clear()
-
-        await message.answer(
-            "❌ Товар не найден."
-        )
-
-        return
-
-    # Проверяем остаток ещё раз
-    cur.execute(
-        """
-        SELECT stock
-        FROM product_sizes
-        WHERE product_id = ?
-        AND size = ?
-        """,
-        (
-            data["product_id"],
-            data["size"]
-        )
-    )
-
-    stock_result = cur.fetchone()
-
-    if not stock_result:
-
-        conn.close()
-
-        await state.clear()
-
-        await message.answer(
-            "❌ Размер не найден."
-        )
-
-        return
-
-    if stock_result["stock"] < data["quantity"]:
-
-        conn.close()
-
-        await message.answer(
-            f"❌ Недостаточно товара.\n\n"
-            f"На складе сейчас: "
-            f"<b>{stock_result['stock']}</b> шт."
-        )
-
-        return
-
-    # Считаем прибыль
-    profit_value = (
-        price - product["purchase_price"]
-    ) * data["quantity"]
-
-    # Уменьшаем остаток
-    cur.execute(
-        """
-        UPDATE product_sizes
-        SET stock = stock - ?
-        WHERE product_id = ?
-        AND size = ?
-        """,
-        (
-            data["quantity"],
-            data["product_id"],
-            data["size"]
-        )
-    )
-
-    # Записываем продажу
-    cur.execute(
-        """
-        INSERT INTO sales
-        (
-            product_id,
-            product_name,
-            size,
-            quantity,
-            sale_price,
-            purchase_price,
-            profit
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data["product_id"],
-            product["name"],
-            data["size"],
-            data["quantity"],
-            price,
-            product["purchase_price"],
-            profit_value
-        )
-    )
-
-    conn.commit()
-    conn.close()
-
-    await state.clear()
-
-    total = price * data["quantity"]
-
-    await message.answer(
-        "✅ <b>Продажа записана!</b>\n\n"
-        f"Товар: <b>{product['name']}</b>\n"
-        f"Размер: <b>{data['size']}</b>\n"
-        f"Количество: <b>{data['quantity']} шт.</b>\n"
-        f"Цена: <b>{price:.2f}</b>\n"
-        f"Сумма: <b>{total:.2f}</b>\n"
-        f"Прибыль: <b>{profit_value:.2f}</b>",
-        reply_markup=get_menu(
-            message.from_user.id
-        )
-    )
-
-
-# =========================================================
-# STATISTICS
-# =========================================================
-
-async def statistics(
-    message: Message
-):
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT COUNT(*) AS count FROM sales"
-    )
-
-    sales_count = cur.fetchone()["count"]
-
-    cur.execute(
-        """
-        SELECT
-            COALESCE(SUM(quantity), 0) AS quantity,
-            COALESCE(
-                SUM(sale_price * quantity),
-                0
-            ) AS revenue,
-            COALESCE(
-                SUM(profit),
-                0
-            ) AS profit
-        FROM sales
-        """
-    )
-
-    stats = cur.fetchone()
-
-    conn.close()
-
-    await message.answer(
-        "📊 <b>Статистика</b>\n\n"
-        f"Количество продаж: "
-        f"<b>{sales_count}</b>\n"
-        f"Продано товаров: "
-        f"<b>{stats['quantity']}</b> шт.\n"
-        f"Выручка: "
-        f"<b>{stats['revenue']:.2f}</b>\n"
-        f"Прибыль: "
-        f"<b>{stats['profit']:.2f}</b>"
-    )
-
-
-# =========================================================
-# PROFIT
-# =========================================================
-
-async def profit(
-    message: Message
-):
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT
-            COALESCE(SUM(profit), 0) AS profit
-        FROM sales
-        """
-    )
-
-    result = cur.fetchone()
-
-    conn.close()
-
-    await message.answer(
-        "💰 <b>Прибыль</b>\n\n"
-        f"Общая прибыль: "
-        f"<b>{result['profit']:.2f}</b>"
-    )
-
-
-# =========================================================
-# EDIT PRODUCT
-# =========================================================
-
-class EditProduct(StatesGroup):
-
-    product = State()
-    name = State()
-    purchase_price = State()
-    sale_price = State()
-
-
-async def edit_product_start(
-    message: Message,
-    state: FSMContext
-):
-
-    await state.clear()
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT id, name
-        FROM products
-        ORDER BY name
-        """
-    )
-
-    products = cur.fetchall()
-
-    conn.close()
-
-    if not products:
-
-        await message.answer(
-            "❌ Товаров пока нет."
-        )
-
-        return
-
-    buttons = []
-
-    for product in products:
-
-        buttons.append([
-            InlineKeyboardButton(
-                text=product["name"],
-                callback_data=f"edit_product:{product['id']}"
-            )
-        ])
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
-
-    await state.set_state(
-        EditProduct.product
-    )
-
-    await message.answer(
-        "✏️ Выберите товар для изменения:",
-        reply_markup=keyboard
-    )
-
-
-@dp.callback_query(
-    F.data.startswith("edit_product:")
-)
-async def edit_product_selected(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    product_id = int(
-        callback.data.split(":")[1]
-    )
-
-    await state.update_data(
-        product_id=product_id
-    )
-
-    await state.set_state(
-        EditProduct.name
-    )
-
-    await callback.message.answer(
-        "Введите новое название товара:"
-    )
-
-    await callback.answer()
-
-
-@dp.message(EditProduct.name)
-async def edit_product_name(
-    message: Message,
-    state: FSMContext
-):
-
-    await state.update_data(
-        name=message.text.strip()
-    )
-
-    await state.set_state(
-        EditProduct.purchase_price
-    )
-
-    await message.answer(
-        "Введите новую закупочную цену:"
-    )
-
-
-@dp.message(EditProduct.purchase_price)
-async def edit_product_purchase(
-    message: Message,
-    state: FSMContext
-):
-
-    try:
-
-        price = float(
-            message.text.replace(",", ".")
-        )
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Введите число."
-        )
-
-        return
-
-    if price < 0:
-
-        await message.answer(
-            "❌ Цена не может быть отрицательной."
-        )
-
-        return
-
-    await state.update_data(
-        purchase_price=price
-    )
-
-    await state.set_state(
-        EditProduct.sale_price
-    )
-
-    await message.answer(
-        "Введите новую цену продажи:"
-    )
-
-
-@dp.message(EditProduct.sale_price)
-async def edit_product_sale(
-    message: Message,
-    state: FSMContext
-):
-
-    try:
-
-        price = float(
-            message.text.replace(",", ".")
-        )
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Введите число."
-        )
-
-        return
-
-    if price < 0:
-
-        await message.answer(
-            "❌ Цена не может быть отрицательной."
-        )
-
-        return
-
-    data = await state.get_data()
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        UPDATE products
-        SET
-            name = ?,
-            purchase_price = ?,
-            sale_price = ?
-        WHERE id = ?
-        """,
-        (
-            data["name"],
-            data["purchase_price"],
-            price,
-            data["product_id"]
-        )
-    )
-
-    conn.commit()
-    conn.close()
-
-    await state.clear()
-
-    await message.answer(
-        "✅ <b>Товар изменён.</b>",
-        reply_markup=get_menu(
-            message.from_user.id
-        )
-    )
-
-
-# =========================================================
-# DELETE PRODUCT
-# =========================================================
-
-async def delete_product_start(
-    message: Message
-):
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT id, name
-        FROM products
-        ORDER BY name
-        """
-    )
-
-    products = cur.fetchall()
-
-    conn.close()
-
-    if not products:
-
-        await message.answer(
-            "🗑️ Удалять пока нечего."
-        )
-
-        return
-
-    buttons = []
-
-    for product in products:
-
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"🗑️ {product['name']}",
-                callback_data=f"delete_product:{product['id']}"
-            )
-        ])
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=buttons
-    )
-
-    await message.answer(
-        "🗑️ <b>Удаление товара</b>\n\n"
-        "Выберите товар:",
-        reply_markup=keyboard
-    )
-
-
-@dp.callback_query(
-    F.data.startswith("delete_product:")
-)
-async def delete_product(
+@dp.callback_query(F.data == "access_back")
+async def access_back(
     callback: CallbackQuery
 ):
 
-    product_id = int(
-        callback.data.split(":")[1]
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить сотрудника",
+                    callback_data="access_add"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👥 Список сотрудников",
+                    callback_data="access_list"
+                )
+            ]
+        ]
     )
 
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT name FROM products WHERE id = ?",
-        (product_id,)
-    )
-
-    product = cur.fetchone()
-
-    if not product:
-
-        conn.close()
-
-        await callback.answer(
-            "❌ Товар не найден.",
-            show_alert=True
-        )
-
-        return
-
-    product_name = product["name"]
-
-    cur.execute(
-        "DELETE FROM products WHERE id = ?",
-        (product_id,)
-    )
-
-    conn.commit()
-    conn.close()
-
-    await callback.message.answer(
-        f"✅ Товар <b>{product_name}</b> удалён.",
-        reply_markup=get_menu(
-            callback.from_user.id
-        )
+    await callback.message.edit_text(
+        "🔐 <b>УПРАВЛЕНИЕ ДОСТУПОМ</b>\n\n"
+        "Выберите действие:",
+        reply_markup=keyboard
     )
 
     await callback.answer()
 
 
 # =========================================================
-# START BOT
+# ЗАПУСК
 # =========================================================
 
 async def main():
 
-    init_db()
-
-    print("Bot started")
+    print("🤖 Бот запускается...")
 
     await dp.start_polling(bot)
 
