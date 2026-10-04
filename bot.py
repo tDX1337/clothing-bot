@@ -173,6 +173,19 @@ def init_db():
         )
     """)
 
+    # -----------------------------------------------------
+    # РУЧНЫЕ ЗНАЧЕНИЯ В РАЗДЕЛЕ "ПРИБЫЛЬ"
+    # -----------------------------------------------------
+    # Здесь хранятся только ручные значения, которые задаёт
+    # создатель. Если ключ отсутствует, используется автомат
+    # расчёт из sales/expenses.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS profit_overrides (
+            key TEXT PRIMARY KEY,
+            value REAL NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -214,6 +227,20 @@ class Access(StatesGroup):
 class Expense(StatesGroup):
     description = State()
     amount = State()
+
+
+class EditExpense(StatesGroup):
+    description = State()
+    amount = State()
+
+
+class EditSale(StatesGroup):
+    sale_price = State()
+    purchase_price = State()
+
+
+class ProfitSettingsEdit(StatesGroup):
+    value = State()
 
 
 # =========================================================
@@ -481,32 +508,43 @@ async def show_stock(message: Message):
 
     products = get_products()
 
-    if not products:
-        await message.answer(
-            "📦 <b>Наличие товаров</b>\n\n"
-            "Товаров пока нет."
-        )
-        return
-
     text = "📦 <b>НАЛИЧИЕ ТОВАРОВ</b>\n\n"
+    visible_products = 0
 
     for product_id, name, purchase_price, sale_price in products:
+        sizes = get_sizes(product_id)
+        available_sizes = [
+            (size_id, size, stock)
+            for size_id, size, stock in sizes
+            if stock > 0
+        ]
+
+        # Товары с нулевым остатком полностью скрываем из наличия.
+        if not available_sizes:
+            continue
+
+        visible_products += 1
+        total_stock = sum(stock for _, _, stock in available_sizes)
 
         text += (
             f"🛍 <b>{name}</b>\n"
             f"Закупка: {money(purchase_price)}\n"
             f"Продажа: {money(sale_price)}\n"
+            f"Всего: <b>{total_stock} шт.</b>\n"
         )
 
-        sizes = get_sizes(product_id)
-
-        if sizes:
-            for _, size, stock in sizes:
-                text += f"   • {size}: <b>{stock} шт.</b>\n"
-        else:
-            text += "   • Нет размеров\n"
+        for _, size, stock in available_sizes:
+            text += f"   • {size}: <b>{stock} шт.</b>\n"
 
         text += "\n"
+
+    if visible_products == 0:
+        await message.answer(
+            "📦 <b>НАЛИЧИЕ ТОВАРОВ</b>\n\n"
+            "Сейчас товаров в наличии нет.\n\n"
+            "Пополните остаток через кнопку «📥 Пополнить остаток»."
+        )
+        return
 
     await message.answer(text)
 
@@ -889,20 +927,24 @@ async def replenish_quantity(
 async def sale_start(message: Message):
 
     products = get_products()
-
-    if not products:
-        await message.answer("🛒 Товаров пока нет.")
-        return
-
     buttons = []
 
     for product_id, name, _, _ in products:
-        buttons.append([
-            InlineKeyboardButton(
-                text=name,
-                callback_data=f"sale_product:{product_id}"
-            )
-        ])
+        sizes = get_sizes(product_id)
+        if any(stock > 0 for _, _, stock in sizes):
+            buttons.append([
+                InlineKeyboardButton(
+                    text=name,
+                    callback_data=f"sale_product:{product_id}"
+                )
+            ])
+
+    if not buttons:
+        await message.answer(
+            "🛒 <b>Продажа</b>\n\n"
+            "❌ Сейчас товаров в наличии нет."
+        )
+        return
 
     await message.answer(
         "🛒 <b>Продажа</b>\n\n"
@@ -1306,100 +1348,804 @@ async def show_profit(message: Message):
     conn = get_db()
     cur = conn.cursor()
 
+    # Уже получено
     cur.execute("""
         SELECT
             COALESCE(SUM(sale_price * quantity), 0),
             COALESCE(SUM(purchase_price * quantity), 0),
             COALESCE(SUM(profit), 0),
-            COALESCE(SUM(quantity), 0)
+            COALESCE(SUM(quantity), 0),
+            COUNT(*)
         FROM sales
         WHERE status = 'completed'
     """)
+    received_revenue, received_cost, received_profit, received_qty, received_orders = cur.fetchone()
 
-    completed_revenue, completed_cost, completed_profit, completed_qty = (
-        cur.fetchone()
-    )
-
+    # Ожидается
     cur.execute("""
         SELECT
             COALESCE(SUM(sale_price * quantity), 0),
             COALESCE(SUM(purchase_price * quantity), 0),
             COALESCE(SUM(profit), 0),
-            COALESCE(SUM(quantity), 0)
+            COALESCE(SUM(quantity), 0),
+            COUNT(*)
         FROM sales
         WHERE status = 'pending'
     """)
+    pending_revenue, pending_cost, pending_profit, pending_qty, pending_orders = cur.fetchone()
 
-    pending_revenue, pending_cost, pending_profit, pending_qty = (
-        cur.fetchone()
-    )
-
+    # Возвраты
     cur.execute("""
-        SELECT COALESCE(SUM(quantity), 0)
+        SELECT
+            COALESCE(SUM(sale_price * quantity), 0),
+            COALESCE(SUM(purchase_price * quantity), 0),
+            COALESCE(SUM(profit), 0),
+            COALESCE(SUM(quantity), 0),
+            COUNT(*)
         FROM sales
         WHERE status = 'returned'
     """)
+    returned_revenue, returned_cost, returned_profit, returned_qty, returned_orders = cur.fetchone()
 
-    returned_qty = cur.fetchone()[0]
-
-    cur.execute("""
-        SELECT COALESCE(SUM(amount), 0)
-        FROM expenses
-    """)
-
+    cur.execute("SELECT COALESCE(SUM(amount), 0) FROM expenses")
     expenses = cur.fetchone()[0]
 
     conn.close()
 
-    net_profit = completed_profit - expenses
-    sold_qty = completed_qty + pending_qty
+    # -----------------------------------------------------
+    # РУЧНЫЕ ПЕРЕОПРЕДЕЛЕНИЯ
+    # -----------------------------------------------------
+    def ov(key, automatic):
+        value = get_profit_override(key)
+        return automatic if value is None else value
+
+    received_revenue = ov("received_revenue", received_revenue)
+    received_cost = ov("received_cost", received_cost)
+    expenses = ov("expenses", expenses)
+    net_received_profit = ov("net_profit", received_profit - expenses)
+    received_orders = int(ov("received_orders", received_orders))
+    received_qty = int(ov("received_qty", received_qty))
+
+    pending_revenue = ov("pending_revenue", pending_revenue)
+    pending_profit = ov("pending_profit", pending_profit)
+    pending_orders = int(ov("pending_orders", pending_orders))
+    pending_qty = int(ov("pending_qty", pending_qty))
+
+    total_revenue_after_pending = ov(
+        "total_revenue_after_pending",
+        received_revenue + pending_revenue
+    )
+    net_after_pending = ov(
+        "net_after_pending",
+        net_received_profit + pending_profit
+    )
+
+    returned_orders = int(ov("returned_orders", returned_orders))
+    returned_qty = int(ov("returned_qty", returned_qty))
+    returned_revenue = ov("returned_revenue", returned_revenue)
 
     text = (
-        "💰 <b>ФИНАНСЫ</b>\n\n"
-        f"💵 Выручка: <b>{money(completed_revenue)}</b>\n"
-        f"📦 Себестоимость: <b>{money(completed_cost)}</b>\n"
-        f"💸 Расходы: <b>{money(expenses)}</b>\n\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Чистая прибыль: <b>{money(net_profit)}</b>\n\n"
-        "⏳ <b>В ОЖИДАНИИ</b>\n\n"
+        "💰 <b>ПРИБЫЛЬ И ДЕНЬГИ</b>\n\n"
+        "✅ <b>УЖЕ ПОЛУЧЕНО</b>\n"
+        f"💵 Выручка: <b>{money(received_revenue)}</b>\n"
+        f"📦 Себестоимость: <b>{money(received_cost)}</b>\n"
+        f"💸 Расходы: <b>{money(expenses)}</b>\n"
+        f"📈 <b>Чистая прибыль: {money(net_received_profit)}</b>\n"
+        f"🧾 Продаж: <b>{received_orders}</b> | Товаров: <b>{received_qty} шт.</b>\n\n"
+        "⏳ <b>ОЖИДАЕТСЯ ПОЛУЧИТЬ</b>\n"
         f"💵 Выручка: <b>{money(pending_revenue)}</b>\n"
-        f"📈 Прибыль: <b>{money(pending_profit)}</b>\n\n"
-        f"📦 Продано: <b>{sold_qty} шт.</b>\n"
-        f"↩️ Возвраты: <b>{returned_qty} шт.</b>"
+        f"📈 Прибыль: <b>{money(pending_profit)}</b>\n"
+        f"🧾 Заказов: <b>{pending_orders}</b> | Товаров: <b>{pending_qty} шт.</b>\n\n"
+        "📊 <b>ЕСЛИ ВСЕ ОЖИДАЮЩИЕ ЗАКАЗЫ БУДУТ ПОЛУЧЕНЫ</b>\n"
+        f"💵 Общая выручка: <b>{money(total_revenue_after_pending)}</b>\n"
+        f"📈 Ожидаемая чистая прибыль: <b>{money(net_after_pending)}</b>\n\n"
+        "↩️ <b>ВОЗВРАТЫ</b>\n"
+        f"Заказов: <b>{returned_orders}</b> | Товаров: <b>{returned_qty} шт.</b>\n"
+        f"Сумма продаж: <b>{money(returned_revenue)}</b>"
     )
+
+    keyboard_rows = [
+        [InlineKeyboardButton(text="➕ Добавить расход", callback_data="expense_add")],
+        [InlineKeyboardButton(text="📋 История расходов", callback_data="expense_history")],
+        [InlineKeyboardButton(text="⏳ Ожидающие заказы", callback_data="pending_orders")],
+        [InlineKeyboardButton(text="↩️ Возвраты", callback_data="returns_list")],
+    ]
+
+    if message.from_user.id == ADMIN_ID:
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                text="⚙️ Настройки прибыли",
+                callback_data="profit_settings"
+            )
+        ])
+
+    await message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    )
+
+
+# =========================================================
+# НАСТРОЙКИ ПОКАЗАТЕЛЕЙ ПРИБЫЛИ — ТОЛЬКО СОЗДАТЕЛЬ
+# =========================================================
+
+PROFIT_SETTING_LABELS = {
+    "received_revenue": ("💰 Выручка", False),
+    "received_cost": ("📦 Себестоимость", False),
+    "expenses": ("💸 Расходы", False),
+    "net_profit": ("📈 Чистая прибыль", False),
+    "received_orders": ("🧾 Продаж", True),
+    "received_qty": ("📦 Товаров", True),
+    "pending_revenue": ("⏳ Ожидаемая выручка", False),
+    "pending_profit": ("⏳ Ожидаемая прибыль", False),
+    "pending_orders": ("⏳ Ожидающих заказов", True),
+    "pending_qty": ("⏳ Ожидающих товаров", True),
+    "total_revenue_after_pending": ("📊 Общая выручка", False),
+    "net_after_pending": ("📊 Ожидаемая чистая прибыль", False),
+    "returned_orders": ("↩️ Возвратов", True),
+    "returned_qty": ("↩️ Возвращено товаров", True),
+    "returned_revenue": ("↩️ Сумма возвратов", False),
+}
+
+
+def get_profit_override(key: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT value FROM profit_overrides WHERE key = ?",
+        (key,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return None if row is None else float(row[0])
+
+
+def set_profit_override(key: str, value: float):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO profit_overrides (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    """, (key, value))
+    conn.commit()
+    conn.close()
+
+
+def clear_profit_override(key: str):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM profit_overrides WHERE key = ?",
+        (key,)
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_all_profit_overrides():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM profit_overrides")
+    conn.commit()
+    conn.close()
+
+
+def profit_setting_display(key: str) -> str:
+    value = get_profit_override(key)
+    label, integer = PROFIT_SETTING_LABELS[key]
+    if value is None:
+        return f"{label}: <b>авто</b>"
+    if integer:
+        return f"{label}: <b>{int(value)}</b>"
+    return f"{label}: <b>{money(value)}</b>"
+
+
+async def show_profit_settings(callback: CallbackQuery):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+
+    # Две колонки: изменение и обнуление. Отдельно внизу
+    # есть возврат к автоматическому расчёту.
+    rows = []
+    for key, (label, integer) in PROFIT_SETTING_LABELS.items():
+        rows.append([
+            InlineKeyboardButton(
+                text=f"✏️ {label}",
+                callback_data=f"profit_edit:{key}"
+            ),
+            InlineKeyboardButton(
+                text="🗑️ 0",
+                callback_data=f"profit_zero:{key}"
+            )
+        ])
+
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                text="🔄 Всё автоматически",
+                callback_data="profit_auto_all"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="⬅️ Назад к прибыли",
+                callback_data="back_to_profit"
+            )
+        ],
+    ])
+
+    text = (
+        "⚙️ <b>НАСТРОЙКИ ПРИБЫЛИ</b>\n\n"
+        "Здесь ты можешь вручную менять ЛЮБОЙ показатель, "
+        "который отображается в разделе прибыли.\n\n"
+        "✏️ — ввести своё значение\n"
+        "🗑️ 0 — обнулить показатель\n"
+        "🔄 Всё автоматически — убрать все ручные значения\n\n"
+        "Текущие ручные значения:\n"
+    )
+
+    for key in PROFIT_SETTING_LABELS:
+        text += profit_setting_display(key) + "\n"
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "profit_settings")
+async def profit_settings(callback: CallbackQuery):
+    await show_profit_settings(callback)
+
+
+@dp.callback_query(F.data.startswith("profit_edit:"))
+async def profit_edit_start(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+
+    key = callback.data.split(":", 1)[1]
+    if key not in PROFIT_SETTING_LABELS:
+        await callback.answer("Неизвестный показатель.", show_alert=True)
+        return
+
+    label, integer = PROFIT_SETTING_LABELS[key]
+    current = get_profit_override(key)
+    current_text = "авто" if current is None else (str(int(current)) if integer else money(current))
+
+    await state.clear()
+    await state.update_data(
+        profit_key=key,
+        profit_integer=integer
+    )
+    await state.set_state(ProfitSettingsEdit.value)
+
+    await callback.message.edit_text(
+        "✏️ <b>ИЗМЕНЕНИЕ ПОКАЗАТЕЛЯ</b>\n\n"
+        f"Показатель: <b>{label}</b>\n"
+        f"Сейчас: <b>{current_text}</b>\n\n"
+        "Введите новое значение.\n"
+        "Например: <code>12262</code>\n\n"
+        "Чтобы вернуться без изменения, нажмите «Отмена»." ,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="profit_edit_cancel")]
+        ])
+    )
+    await callback.answer()
+
+
+@dp.message(ProfitSettingsEdit.value)
+async def profit_edit_value(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    key = data.get("profit_key")
+    integer = data.get("profit_integer", False)
+
+    if not key or key not in PROFIT_SETTING_LABELS:
+        await state.clear()
+        await message.answer("❌ Настройка потеряна. Откройте прибыль заново.")
+        return
+
+    try:
+        raw = message.text.replace(" ", "").replace(",", ".")
+        value = float(raw)
+        if value < 0:
+            raise ValueError
+        if integer and not value.is_integer():
+            raise ValueError
+    except (ValueError, AttributeError):
+        await message.answer(
+            "❌ Некорректное значение.\n\n"
+            "Для денег: <code>12262</code>\n"
+            "Для количества: <code>3</code>"
+        )
+        return
+
+    set_profit_override(key, value)
+    await state.clear()
+
+    label, _ = PROFIT_SETTING_LABELS[key]
+    display = str(int(value)) if integer else money(value)
+
+    await message.answer(
+        "✅ <b>Показатель изменён</b>\n\n"
+        f"{label}: <b>{display}</b>"
+    )
+
+    # После сохранения сразу показываем панель настроек новым сообщением.
+    await send_profit_settings_message(message)
+
+
+async def send_profit_settings_message(message: Message):
+    rows = []
+    for key, (label, integer) in PROFIT_SETTING_LABELS.items():
+        rows.append([
+            InlineKeyboardButton(
+                text=f"✏️ {label}",
+                callback_data=f"profit_edit:{key}"
+            ),
+            InlineKeyboardButton(
+                text="🗑️ 0",
+                callback_data=f"profit_zero:{key}"
+            )
+        ])
+
+    rows.extend([
+        [InlineKeyboardButton(text="🔄 Всё автоматически", callback_data="profit_auto_all")],
+        [InlineKeyboardButton(text="⬅️ Назад к прибыли", callback_data="back_to_profit")],
+    ])
+
+    text = (
+        "⚙️ <b>НАСТРОЙКИ ПРИБЫЛИ</b>\n\n"
+        "Здесь можно вручную менять любой показатель прибыли.\n\n"
+    )
+    for key in PROFIT_SETTING_LABELS:
+        text += profit_setting_display(key) + "\n"
+
+    await message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
+
+@dp.callback_query(F.data.startswith("profit_zero:"))
+async def profit_zero(callback: CallbackQuery):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+
+    key = callback.data.split(":", 1)[1]
+    if key not in PROFIT_SETTING_LABELS:
+        await callback.answer("Неизвестный показатель.", show_alert=True)
+        return
+
+    set_profit_override(key, 0)
+    await callback.answer("✅ Показатель обнулён.")
+    await show_profit_settings(callback)
+
+
+@dp.callback_query(F.data == "profit_auto_all")
+async def profit_auto_all(callback: CallbackQuery, state: FSMContext):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+
+    await state.clear()
+    clear_all_profit_overrides()
+    await callback.answer("✅ Все показатели снова считаются автоматически.")
+    await show_profit_settings(callback)
+
+
+@dp.callback_query(F.data == "profit_edit_cancel")
+async def profit_edit_cancel(callback: CallbackQuery, state: FSMContext):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+
+    await state.clear()
+    await show_profit_settings(callback)
+
+
+@dp.callback_query(F.data == "open_profit")
+async def open_profit(callback: CallbackQuery):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+    await show_profit(callback.message)
+    await callback.answer()
+
+
+# =========================================================
+# ПАНЕЛЬ СОЗДАТЕЛЯ
+# =========================================================
+
+async def settings_start(message: Message):
+    """Главная панель создателя. Доступ только ADMIN_ID."""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Настройки доступны только создателю.")
+        return
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="➕ Добавить расход",
-                    callback_data="expense_add"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📋 История расходов",
-                    callback_data="expense_history"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⏳ Ожидающие заказы",
-                    callback_data="pending_orders"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="↩️ Возвраты",
-                    callback_data="returns_list"
-                )
-            ]
+            [InlineKeyboardButton(text="📦 Товары", callback_data="creator_products")],
+            [InlineKeyboardButton(text="📊 Продажи и история", callback_data="creator_sales")],
+            [InlineKeyboardButton(text="💰 Прибыль и расходы", callback_data="creator_profit")],
+            [InlineKeyboardButton(text="📥 Остатки", callback_data="creator_stock")],
+            [InlineKeyboardButton(text="🔐 Доступ сотрудников", callback_data="creator_access")],
+            [InlineKeyboardButton(text="🗑️ Удаление данных", callback_data="creator_delete")],
+            [InlineKeyboardButton(text="ℹ️ Что можно менять", callback_data="creator_info")],
         ]
     )
 
     await message.answer(
-        text,
+        "⚙️ <b>ПАНЕЛЬ СОЗДАТЕЛЯ</b>\n\n"
+        "Это закрытый раздел только для тебя.\n\n"
+        "Здесь можно управлять основными данными бота: товарами, ценами, остатками, продажами, "
+        "расходами, прибылью и доступом сотрудников.\n\n"
+        "⚠️ Изменения в истории продаж и удаление данных могут повлиять на статистику и прибыль.",
         reply_markup=keyboard
+    )
+
+
+def creator_main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Товары", callback_data="creator_products")],
+            [InlineKeyboardButton(text="📊 Продажи и история", callback_data="creator_sales")],
+            [InlineKeyboardButton(text="💰 Прибыль и расходы", callback_data="creator_profit")],
+            [InlineKeyboardButton(text="📥 Остатки", callback_data="creator_stock")],
+            [InlineKeyboardButton(text="🔐 Доступ сотрудников", callback_data="creator_access")],
+            [InlineKeyboardButton(text="🗑️ Удаление данных", callback_data="creator_delete")],
+            [InlineKeyboardButton(text="ℹ️ Что можно менять", callback_data="creator_info")],
+        ]
+    )
+
+
+def creator_guard(callback: CallbackQuery) -> bool:
+    return callback.from_user.id == ADMIN_ID
+
+
+@dp.callback_query(F.data == "creator_products")
+async def creator_products(callback: CallbackQuery):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "📦 <b>УПРАВЛЕНИЕ ТОВАРАМИ</b>\n\n"
+        "Здесь можно менять данные товаров и управлять их состоянием.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Изменить товар", callback_data="creator_edit_product")],
+            [InlineKeyboardButton(text="➕ Добавить товар", callback_data="creator_add_product")],
+            [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="creator_delete_product")],
+            [InlineKeyboardButton(text="📥 Изменить остаток", callback_data="creator_stock")],
+            [InlineKeyboardButton(text="⬅️ В панель создателя", callback_data="creator_home")],
+        ])
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "creator_edit_product")
+async def creator_edit_product(callback: CallbackQuery, state: FSMContext):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+    await state.clear()
+    await edit_product_start(callback.message)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "creator_add_product")
+async def creator_add_product(callback: CallbackQuery, state: FSMContext):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+    await state.clear()
+    await add_product_start(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "creator_delete_product")
+async def creator_delete_product(callback: CallbackQuery):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+    await delete_product_start(callback.message)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "creator_stock")
+async def creator_stock(callback: CallbackQuery):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+    await replenish_start(callback.message)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "creator_profit")
+async def creator_profit(callback: CallbackQuery):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "💰 <b>УПРАВЛЕНИЕ ПРИБЫЛЬЮ</b>\n\n"
+        "Здесь можно управлять финансовой частью бота.\n"
+        "Кнопка «Настройки показателей» позволяет вручную "
+        "изменять или обнулять значения прямо на экране прибыли.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Настройки показателей", callback_data="profit_settings")],
+            [InlineKeyboardButton(text="📊 Открыть прибыль", callback_data="open_profit")],
+            [InlineKeyboardButton(text="💸 Добавить расход", callback_data="expense_add")],
+            [InlineKeyboardButton(text="📋 История расходов", callback_data="expense_history")],
+            [InlineKeyboardButton(text="📊 Редактор продаж", callback_data="creator_sales")],
+            [InlineKeyboardButton(text="⬅️ В панель создателя", callback_data="creator_home")],
+        ])
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "creator_sales")
+async def creator_sales(callback: CallbackQuery):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, product_name, size, quantity, sale_price, purchase_price,
+               profit, payment_method, status, created_at
+        FROM sales
+        ORDER BY id DESC
+        LIMIT 30
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        await callback.message.edit_text(
+            "📊 <b>РЕДАКТОР ПРОДАЖ</b>\n\nПродаж пока нет.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="creator_home")]
+            ])
+        )
+        await callback.answer()
+        return
+
+    text = "📊 <b>РЕДАКТОР ПРОДАЖ</b>\n\n"
+    buttons = []
+
+    for sale_id, product_name, size, quantity, sale_price, purchase_price, profit, payment_method, status, created_at in rows:
+        status_text = {
+            "completed": "✅ получено",
+            "pending": "⏳ ожидается",
+            "returned": "↩️ возврат",
+        }.get(status, status)
+
+        text += (
+            f"🆔 <b>#{sale_id}</b> — {product_name} / {size}\n"
+            f"{quantity} шт. × {money(sale_price)} = {money(sale_price * quantity)}\n"
+            f"Статус: {status_text} | Прибыль: {money(profit)}\n"
+            f"🕒 {created_at}\n\n"
+        )
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"✏️ Продажа #{sale_id}",
+                callback_data=f"creator_sale_edit:{sale_id}"
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton(text="⬅️ В панель создателя", callback_data="creator_home")])
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "creator_access")
+async def creator_access(callback: CallbackQuery, state: FSMContext):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+    await state.clear()
+    await access_start(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "creator_delete")
+async def creator_delete(callback: CallbackQuery):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "🗑️ <b>УДАЛЕНИЕ ДАННЫХ</b>\n\n"
+        "Удаление товара не удаляет историю его продаж.\n\n"
+        "Удалять отдельные продажи автоматически не предлагаю, чтобы случайно не испортить расчёт прибыли. "
+        "Для этого используется редактор продаж и возвраты.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑️ Удалить товар", callback_data="creator_delete_product")],
+            [InlineKeyboardButton(text="⬅️ В панель создателя", callback_data="creator_home")],
+        ])
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "creator_info")
+async def creator_info(callback: CallbackQuery):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "ℹ️ <b>ЧТО МОЖНО МЕНЯТЬ</b>\n\n"
+        "📦 Товары — название, закупочная цена, цена продажи.\n"
+        "📥 Остатки — количество товара по размерам.\n"
+        "📊 Продажи — контроль и корректировка данных продажи.\n"
+        "💸 Расходы — добавление и редактирование расходов.\n"
+        "💰 Прибыль — пересчитывается автоматически после изменения данных.\n"
+        "🔐 Доступ — добавление и удаление сотрудников.\n\n"
+        "Обычные сотрудники эту панель не видят.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ В панель создателя", callback_data="creator_home")]
+        ])
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "creator_home")
+async def creator_home(callback: CallbackQuery):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "⚙️ <b>ПАНЕЛЬ СОЗДАТЕЛЯ</b>\n\n"
+        "Выбери раздел:",
+        reply_markup=creator_main_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_back")
+async def settings_back(callback: CallbackQuery):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+    await creator_home(callback)
+
+# =========================================================
+# РЕДАКТОР ПРОДАЖ — ТОЛЬКО СОЗДАТЕЛЬ
+# =========================================================
+
+@dp.callback_query(F.data.startswith("creator_sale_edit:"))
+async def creator_sale_edit_start(callback: CallbackQuery, state: FSMContext):
+    if not creator_guard(callback):
+        await callback.answer("⛔ Только для создателя.", show_alert=True)
+        return
+
+    sale_id = int(callback.data.split(":")[1])
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT product_name, size, quantity, sale_price, purchase_price,
+               profit, status
+        FROM sales
+        WHERE id = ?
+    """, (sale_id,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        await callback.answer("Продажа не найдена.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.update_data(edit_sale_id=sale_id)
+    await state.set_state(EditSale.sale_price)
+
+    product_name, size, quantity, sale_price, purchase_price, profit, status = row
+
+    await callback.message.edit_text(
+        f"✏️ <b>РЕДАКТИРОВАНИЕ ПРОДАЖИ #{sale_id}</b>\n\n"
+        f"🛍 {product_name}\n"
+        f"Размер: {size}\n"
+        f"Количество: {quantity} шт.\n"
+        f"Статус: {status}\n\n"
+        f"Текущая цена продажи: <b>{money(sale_price)}</b>\n"
+        f"Текущая закупка: <b>{money(purchase_price)}</b>\n"
+        f"Текущая прибыль: <b>{money(profit)}</b>\n\n"
+        "Введите новую цену продажи за 1 шт. (₽):"
+    )
+    await callback.answer()
+
+
+@dp.message(EditSale.sale_price)
+async def creator_sale_edit_sale_price(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        await state.clear()
+        return
+
+    try:
+        sale_price = float(message.text.replace(",", "."))
+        if sale_price < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите корректную цену, например: 2990")
+        return
+
+    await state.update_data(new_sale_price=sale_price)
+    await state.set_state(EditSale.purchase_price)
+    await message.answer("Введите новую закупочную цену за 1 шт. (₽):")
+
+
+@dp.message(EditSale.purchase_price)
+async def creator_sale_edit_purchase_price(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        await state.clear()
+        return
+
+    try:
+        purchase_price = float(message.text.replace(",", "."))
+        if purchase_price < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите корректную закупочную цену, например: 1500")
+        return
+
+    data = await state.get_data()
+    sale_id = data["edit_sale_id"]
+    sale_price = data["new_sale_price"]
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT quantity, product_name, size, status FROM sales WHERE id = ?", (sale_id,))
+    sale = cur.fetchone()
+
+    if not sale:
+        conn.close()
+        await state.clear()
+        await message.answer("❌ Продажа не найдена.", reply_markup=get_menu(message.from_user.id))
+        return
+
+    quantity, product_name, size, status = sale
+    profit = (sale_price - purchase_price) * quantity
+
+    cur.execute("""
+        UPDATE sales
+        SET sale_price = ?, purchase_price = ?, profit = ?
+        WHERE id = ?
+    """, (sale_price, purchase_price, profit, sale_id))
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Продажа исправлена</b>\n\n"
+        f"🆔 Продажа #{sale_id}\n"
+        f"🛍 {product_name}\n"
+        f"Размер: {size}\n"
+        f"Количество: {quantity} шт.\n"
+        f"Цена продажи: {money(sale_price)} / шт.\n"
+        f"Закупка: {money(purchase_price)} / шт.\n"
+        f"Прибыль по продаже: <b>{money(profit)}</b>\n\n"
+        "💰 Общая прибыль будет пересчитана автоматически.",
+        reply_markup=get_menu(message.from_user.id)
     )
 
 
